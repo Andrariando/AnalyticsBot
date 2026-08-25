@@ -18,6 +18,7 @@ from app.tools.visualization_tools import ChartGenerationTool
 from app.tools.supply_chain import SupplyChainAnalyticsService
 from app.tools.modeling import PredictiveModelingService
 from app.tools.reporting import ReportingService
+from app.tools.notebook_tools import JupyterNotebookBuilder
 from app.agents.critic import CriticAgent
 
 logger = logging.getLogger(__name__)
@@ -193,13 +194,28 @@ class SupervisorAgent:
             )
 
         async def run_python_analysis(code_string: str, script_name: str = "analysis.py") -> Dict[str, Any]:
-            """Execute sandboxed Python analysis script in the project workspace."""
+            """Execute arbitrary custom Python analysis script in sandboxed project runtime."""
             res = await PythonAnalyticsRuntime.execute_code(
                 project_id=project_id,
                 code_string=code_string,
                 script_name=script_name,
             )
             return res.model_dump()
+
+        async def create_custom_jupyter_notebook(
+            title: str,
+            sections: List[Dict[str, Any]],
+            filename: str = "custom_analysis.ipynb",
+        ) -> Dict[str, Any]:
+            """Compile an interactive, commented Jupyter Notebook (.ipynb) with Markdown commentary and executable Python code cells."""
+            return await JupyterNotebookBuilder.build_and_save_notebook(
+                db=db,
+                project_id=project_id,
+                title=title,
+                sections=sections,
+                filename=filename,
+                execute_code=True,
+            )
 
         async def generate_pareto_chart(
             file_id: str,
@@ -229,7 +245,7 @@ class SupervisorAgent:
             return await critic.evaluate_project(db=db, project_id=project_id)
 
         async def generate_executive_deliverables() -> Dict[str, Any]:
-            """Generate the final executive strategy memo, full technical report, action CSVs, and Jupyter notebook."""
+            """Generate final Executive Strategy Memo, Full Technical Report, and reproducible Jupyter Notebook."""
             return await ReportingService.generate_executive_deliverables(db=db, project_id=project_id)
 
         async def log_assumption(
@@ -362,24 +378,12 @@ class SupervisorAgent:
             ),
             ToolDefinition(
                 name="profile_dataset",
-                description="Run deterministic statistical and structural data profiling on a tabular dataset. Returns rows, columns, null rates, key candidates, and quality alerts.",
+                description="Run deterministic statistical and structural data profiling on a tabular dataset.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "file_id": {"type": "string", "description": "The unique ID of the file to profile."},
-                        "rules": {
-                            "type": "array",
-                            "description": "Optional custom business rule expressions to validate.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {"type": "string"},
-                                    "expression": {"type": "string"},
-                                    "columns": {"type": "array", "items": {"type": "string"}},
-                                },
-                                "required": ["name", "expression"],
-                            },
-                        },
+                        "file_id": {"type": "string"},
+                        "rules": {"type": "array"},
                     },
                     "required": ["file_id"],
                     "additionalProperties": False,
@@ -388,16 +392,54 @@ class SupervisorAgent:
             ),
             ToolDefinition(
                 name="clean_dataset",
-                description="Clean tabular dataset while preserving raw values, capping fulfillment anomalies, clipping negative inventories, and logging data quality issues.",
+                description="Clean tabular dataset while preserving raw values, capping fulfillment anomalies, and logging data quality issues.",
                 parameters={
                     "type": "object",
-                    "properties": {
-                        "file_id": {"type": "string", "description": "The unique ID of the file to clean."}
-                    },
+                    "properties": {"file_id": {"type": "string"}},
                     "required": ["file_id"],
                     "additionalProperties": False,
                 },
                 handler=clean_dataset,
+            ),
+            ToolDefinition(
+                name="run_python_analysis",
+                description="Write and execute any custom Python script in the sandboxed runtime.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "code_string": {"type": "string"},
+                        "script_name": {"type": "string"},
+                    },
+                    "required": ["code_string"],
+                    "additionalProperties": False,
+                },
+                handler=run_python_analysis,
+            ),
+            ToolDefinition(
+                name="create_custom_jupyter_notebook",
+                description="Compile an interactive, well-documented Jupyter Notebook (.ipynb) with Markdown commentary and executable Python code cells.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "sections": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "commentary": {"type": "string"},
+                                    "code": {"type": "string"},
+                                },
+                                "required": ["title"],
+                            },
+                        },
+                        "filename": {"type": "string"},
+                    },
+                    "required": ["title", "sections"],
+                    "additionalProperties": False,
+                },
+                handler=create_custom_jupyter_notebook,
             ),
             ToolDefinition(
                 name="calculate_velocity_segmentation",
@@ -435,9 +477,7 @@ class SupervisorAgent:
                 description="Generate lateral inventory transfer action queue matching long nodes with short nodes.",
                 parameters={
                     "type": "object",
-                    "properties": {
-                        "transfer_lanes_file_id": {"type": "string"},
-                    },
+                    "properties": {"transfer_lanes_file_id": {"type": "string"}},
                     "additionalProperties": False,
                 },
                 handler=generate_rebalance_candidates,
@@ -461,26 +501,12 @@ class SupervisorAgent:
                 handler=generate_executive_deliverables,
             ),
             ToolDefinition(
-                name="run_python_analysis",
-                description="Execute a sandboxed Python analysis script in the project workspace.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "code_string": {"type": "string", "description": "Complete Python script to execute."},
-                        "script_name": {"type": "string", "description": "Filename to save the script under."},
-                    },
-                    "required": ["code_string"],
-                    "additionalProperties": False,
-                },
-                handler=run_python_analysis,
-            ),
-            ToolDefinition(
                 name="generate_pareto_chart",
-                description="Generate a high-resolution Pareto concentration chart comparing cumulative dollar volume vs unit volume.",
+                description="Generate a high-resolution Pareto concentration chart.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "file_id": {"type": "string", "description": "File containing SKU volumes."},
+                        "file_id": {"type": "string"},
                         "sku_col": {"type": "string"},
                         "dollar_col": {"type": "string"},
                         "unit_col": {"type": "string"},
@@ -496,13 +522,9 @@ class SupervisorAgent:
                 parameters={
                     "type": "object",
                     "properties": {
-                        "assumption": {"type": "string", "description": "The assumption being made."},
-                        "rationale": {"type": "string", "description": "Why this assumption is justifiable."},
-                        "sensitivity_tier": {
-                            "type": "string",
-                            "enum": ["ROBUST", "MODERATELY_SENSITIVE", "FRAGILE"],
-                            "description": "Estimated sensitivity of project outcomes to this assumption.",
-                        },
+                        "assumption": {"type": "string"},
+                        "rationale": {"type": "string"},
+                        "sensitivity_tier": {"type": "string", "enum": ["ROBUST", "MODERATELY_SENSITIVE", "FRAGILE"]},
                     },
                     "required": ["assumption"],
                     "additionalProperties": False,
@@ -515,14 +537,10 @@ class SupervisorAgent:
                 parameters={
                     "type": "object",
                     "properties": {
-                        "decision": {"type": "string", "description": "The decision made."},
-                        "reason": {"type": "string", "description": "Analytical rationale for this decision."},
-                        "alternatives": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Alternative options considered.",
-                        },
-                        "risk_assessment": {"type": "string", "description": "Operational or analytical risk."},
+                        "decision": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "alternatives": {"type": "array", "items": {"type": "string"}},
+                        "risk_assessment": {"type": "string"},
                     },
                     "required": ["decision", "reason"],
                     "additionalProperties": False,
@@ -531,12 +549,12 @@ class SupervisorAgent:
             ),
             ToolDefinition(
                 name="update_project_framing",
-                description="Update the structured framing, target decision, stakeholders, and constraints of the project.",
+                description="Update structured framing, target decision, stakeholders, and constraints.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "objective": {"type": "string", "description": "Refined problem objective."},
-                        "target_decision": {"type": "string", "description": "The specific operational decision."},
+                        "objective": {"type": "string"},
+                        "target_decision": {"type": "string"},
                         "stakeholders": {"type": "array", "items": {"type": "string"}},
                         "constraints": {"type": "object"},
                     },
@@ -546,7 +564,7 @@ class SupervisorAgent:
             ),
             ToolDefinition(
                 name="advance_project_phase",
-                description="Advance the project state machine to the next valid analytical phase.",
+                description="Advance project state machine to next phase.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -563,7 +581,6 @@ class SupervisorAgent:
                                 "DOCUMENTATION",
                                 "COMPLETE",
                             ],
-                            "description": "The target phase to transition into.",
                         }
                     },
                     "required": ["target_phase"],
@@ -573,12 +590,10 @@ class SupervisorAgent:
             ),
             ToolDefinition(
                 name="search_knowledge_base",
-                description="Search the global knowledge base of modeling techniques and methodologies.",
+                description="Search the global knowledge base.",
                 parameters={
                     "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Semantic search query."}
-                    },
+                    "properties": {"query": {"type": "string"}},
                     "required": ["query"],
                     "additionalProperties": False,
                 },

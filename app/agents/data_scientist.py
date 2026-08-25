@@ -7,6 +7,7 @@ from app.config import settings
 from app.tools.supply_chain import SupplyChainAnalyticsService
 from app.tools.modeling import PredictiveModelingService
 from app.tools.runtime import PythonAnalyticsRuntime
+from app.tools.notebook_tools import JupyterNotebookBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,8 @@ logger = logging.getLogger(__name__)
 class DataScientistAgent:
     """
     Senior Data Scientist & Operations Research Analyst responsible for data modeling,
-    statistical calculations, velocity segmentation, inventory policy, and forecasting.
+    statistical calculations, velocity segmentation, inventory policy, forecasting,
+    and custom Jupyter notebook creation.
     """
 
     def __init__(self, model_name: Optional[str] = None):
@@ -28,7 +30,7 @@ class DataScientistAgent:
         context_data: Optional[Dict[str, Any]] = None,
     ) -> AgentResponse:
         """
-        Executes a targeted data science or operations research task for a project.
+        Executes a targeted data science, OR, or notebook generation task for a project.
         """
         tools = self._build_data_scientist_tools(db=db, project_id=project_id)
         agent = BaseAgent(
@@ -48,7 +50,7 @@ class DataScientistAgent:
         return await agent.run_turn(messages=messages)
 
     def _build_data_scientist_tools(self, db: AsyncSession, project_id: str) -> List[ToolDefinition]:
-        """Construct the Data Scientist's specialized analytics and modeling tool suite."""
+        """Construct the Data Scientist's specialized analytics, modeling, and notebook creation tool suite."""
 
         async def calculate_velocity_segmentation(
             demand_file_id: str,
@@ -70,7 +72,7 @@ class DataScientistAgent:
             parts_file_id: Optional[str] = None,
             warehouses_file_id: Optional[str] = None,
         ) -> Dict[str, Any]:
-            """Calculate dynamic Safety Stock, ROP, Order-Up-To, Target WOS, and Excess/Shortage amounts."""
+            """Calculate dynamic Safety Stock, ROP, Order-Up-To, Target WOS, and Excess/Shortages."""
             return await SupplyChainAnalyticsService.calculate_stocking_policy(
                 db=db,
                 project_id=project_id,
@@ -123,24 +125,81 @@ class DataScientistAgent:
                 demand_file_id=demand_file_id,
             )
 
-        async def run_custom_analysis(code_string: str) -> Dict[str, Any]:
+        async def run_custom_analysis(code_string: str, script_name: str = "custom_script.py") -> Dict[str, Any]:
             """Run custom Python analytics script in sandboxed project runtime."""
             res = await PythonAnalyticsRuntime.execute_code(
                 project_id=project_id,
                 code_string=code_string,
+                script_name=script_name,
             )
             return res.model_dump()
 
+        async def create_custom_jupyter_notebook(
+            title: str,
+            sections: List[Dict[str, Any]],
+            filename: str = "custom_analysis.ipynb",
+        ) -> Dict[str, Any]:
+            """Compile an interactive, commented Jupyter Notebook (.ipynb) with explanatory Markdown and executable Python code cells."""
+            return await JupyterNotebookBuilder.build_and_save_notebook(
+                db=db,
+                project_id=project_id,
+                title=title,
+                sections=sections,
+                filename=filename,
+                execute_code=True,
+            )
+
         return [
             ToolDefinition(
-                name="calculate_velocity_segmentation",
-                description="Classify SKUs by velocity (ABC Dollar/Unit), demand variability (XYZ), and intermittency (Syntetos-Boylan ADI/CV2 into Smooth, Erratic, Intermittent, Lumpy).",
+                name="run_custom_analysis",
+                description="Write and execute any arbitrary custom Python analysis script in the sandboxed runtime. Can perform custom data munging, regression, optimization, or custom chart plotting.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "demand_file_id": {"type": "string", "description": "ID of weekly demand dataset."},
-                        "parts_file_id": {"type": "string", "description": "Optional ID of parts master dataset."},
-                        "demand_window_weeks": {"type": "integer", "description": "Number of recent weeks to analyze (default 26)."},
+                        "code_string": {"type": "string", "description": "Python code to execute."},
+                        "script_name": {"type": "string", "description": "Filename to save the script under."},
+                    },
+                    "required": ["code_string"],
+                    "additionalProperties": False,
+                },
+                handler=run_custom_analysis,
+            ),
+            ToolDefinition(
+                name="create_custom_jupyter_notebook",
+                description="Compile an interactive, well-documented Jupyter Notebook (.ipynb) with Markdown commentary and executable Python code cells.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Title of the notebook."},
+                        "sections": {
+                            "type": "array",
+                            "description": "List of sections. Each section has 'title', 'commentary' (Markdown text), and 'code' (Python code).",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "commentary": {"type": "string"},
+                                    "code": {"type": "string"},
+                                },
+                                "required": ["title"],
+                            },
+                        },
+                        "filename": {"type": "string", "description": "Filename e.g. 'demand_elasticity_analysis.ipynb'."},
+                    },
+                    "required": ["title", "sections"],
+                    "additionalProperties": False,
+                },
+                handler=create_custom_jupyter_notebook,
+            ),
+            ToolDefinition(
+                name="calculate_velocity_segmentation",
+                description="Classify SKUs by velocity (ABC Dollar/Unit), demand variability (XYZ), and intermittency (Syntetos-Boylan ADI/CV2).",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "demand_file_id": {"type": "string"},
+                        "parts_file_id": {"type": "string"},
+                        "demand_window_weeks": {"type": "integer"},
                     },
                     "required": ["demand_file_id"],
                     "additionalProperties": False,
@@ -149,14 +208,14 @@ class DataScientistAgent:
             ),
             ToolDefinition(
                 name="calculate_stocking_policy",
-                description="Compute dynamic Safety Stock, Reorder Point (ROP), Order-Up-To level, Target WOS, and quantify excess/shortages across all SKU-DC nodes.",
+                description="Compute dynamic Safety Stock, ROP, Order-Up-To level, and Target WOS across all SKU-DC nodes.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "inventory_file_id": {"type": "string", "description": "ID of inventory snapshot file."},
-                        "demand_file_id": {"type": "string", "description": "ID of weekly demand file."},
-                        "parts_file_id": {"type": "string", "description": "Optional ID of parts file."},
-                        "warehouses_file_id": {"type": "string", "description": "Optional ID of warehouses file."},
+                        "inventory_file_id": {"type": "string"},
+                        "demand_file_id": {"type": "string"},
+                        "parts_file_id": {"type": "string"},
+                        "warehouses_file_id": {"type": "string"},
                     },
                     "required": ["inventory_file_id", "demand_file_id"],
                     "additionalProperties": False,
@@ -165,11 +224,11 @@ class DataScientistAgent:
             ),
             ToolDefinition(
                 name="generate_rebalance_candidates",
-                description="Generate costed multi-DC lateral inventory transfer action queue to relieve shortages from excess DC stock without putting origin into shortage.",
+                description="Generate lateral inventory transfer action queue matching long nodes with short nodes.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "transfer_lanes_file_id": {"type": "string", "description": "Optional ID of transfer lanes cost matrix."},
+                        "transfer_lanes_file_id": {"type": "string"},
                     },
                     "additionalProperties": False,
                 },
@@ -177,19 +236,19 @@ class DataScientistAgent:
             ),
             ToolDefinition(
                 name="generate_disposition_candidates",
-                description="Generate disposition action queue (Vendor Returns for contract-eligible items, Liquidation, or Scrap for dead stock).",
+                description="Generate disposition action queue (Vendor Returns for contract-eligible items, Liquidation, or Scrap).",
                 parameters={"type": "object", "properties": {}, "additionalProperties": False},
                 handler=generate_disposition_candidates,
             ),
             ToolDefinition(
                 name="train_demand_forecast",
-                description="Train time-series forecasting model comparing against Naive, Moving Average, and Croston baselines. Evaluates MAE, RMSE, wMAPE on out-of-time test split.",
+                description="Train time-series forecasting model comparing against Naive, Moving Average, and Croston baselines.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "demand_file_id": {"type": "string", "description": "ID of weekly demand dataset."},
-                        "target_sku": {"type": "string", "description": "Optional specific SKU to forecast."},
-                        "forecast_horizon_weeks": {"type": "integer", "description": "Horizon periods in weeks (default 4)."},
+                        "demand_file_id": {"type": "string"},
+                        "target_sku": {"type": "string"},
+                        "forecast_horizon_weeks": {"type": "integer"},
                     },
                     "required": ["demand_file_id"],
                     "additionalProperties": False,
@@ -198,29 +257,16 @@ class DataScientistAgent:
             ),
             ToolDefinition(
                 name="train_stockout_classifier",
-                description="Train machine learning classifier to predict stockout risk in next 4 weeks. Evaluates Precision, Recall, PR-AUC against a baseline heuristic.",
+                description="Train machine learning classifier to predict stockout risk in next 4 weeks.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "inventory_file_id": {"type": "string", "description": "ID of inventory snapshot dataset."},
-                        "demand_file_id": {"type": "string", "description": "ID of weekly demand dataset."},
+                        "inventory_file_id": {"type": "string"},
+                        "demand_file_id": {"type": "string"},
                     },
                     "required": ["inventory_file_id", "demand_file_id"],
                     "additionalProperties": False,
                 },
                 handler=train_stockout_classifier,
-            ),
-            ToolDefinition(
-                name="run_custom_analysis",
-                description="Run custom Python analytics script in sandboxed project runtime.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "code_string": {"type": "string", "description": "Python code to execute."},
-                    },
-                    "required": ["code_string"],
-                    "additionalProperties": False,
-                },
-                handler=run_custom_analysis,
             ),
         ]

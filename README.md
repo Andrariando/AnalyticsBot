@@ -1,15 +1,15 @@
 # 📊 Autonomous Business Analytics Operating System
 
-An enterprise-grade autonomous Business Analytics platform that combines **consultant-level business framing and synthesis** with **deterministic Python computation, operations research optimization, predictive statistical modeling, and state machine quality gates**.
+An enterprise-grade autonomous Business Analytics platform that combines **consultant-level business framing and synthesis** with **dynamic Python code execution, operations research optimization, predictive statistical modeling, interactive Jupyter Notebook creation, and state machine quality gates**.
 
 ---
 
 ## 📖 Table of Contents
 1. [User Guide: How to Use This Properly](#-user-guide-how-to-use-this-properly)
-2. [What to Expect (Outputs & Deliverables)](#-what-to-expect-outputs--deliverables)
-3. [Telegram Bot Commands & Interactions](#-telegram-bot-commands--interactions)
-4. [System Architecture Diagram](#-system-architecture-diagram)
-5. [End-to-End Analytical Pipeline](#-end-to-end-analytical-pipeline)
+2. [Dual Execution Engine (OR Suite vs. Custom Python Notebooks)](#-dual-execution-engine-step-4-deep-dive)
+3. [What to Expect (Outputs & Deliverables)](#-what-to-expect-outputs--deliverables)
+4. [Telegram Bot Commands & Interactions](#-telegram-bot-commands--interactions)
+5. [System Architecture Diagram](#-system-architecture-diagram)
 6. [Mathematical Formulations Implemented](#-mathematical-formulations-implemented)
 7. [Deployment & 24/7 Operation Guide](#-deployment--247-operation-guide)
 8. [Automated Tests & Quality Verification](#-automated-tests--quality-verification)
@@ -28,7 +28,7 @@ flowchart LR
 
     A["1. START PROJECT<br>/new <Title>"]:::step --> B["2. UPLOAD DATA<br>Attach CSV, Excel, PDF"]:::step
     B --> C["3. PROPOSAL GATE<br>Bot proposes plan & asks clarity"]:::gate
-    C -->|Manager Confirms| D["4. PYTHON EXECUTION<br>OR, Segmentation, LP, Charts"]:::step
+    C -->|Manager Confirms| D["4. DUAL EXECUTION<br>OR Suite OR Custom Python Notebook"]:::step
     D --> E["5. CRITIC GATE<br>Technical & Business Audit"]:::gate
     E --> F["6. DELIVERABLES<br>Memo, Report, CSVs, Notebook"]:::out
 ```
@@ -40,24 +40,63 @@ flowchart LR
 
 ### Step 2: Upload Your Datasets
 Attach your data files directly to the Telegram chat (or via REST API `POST /api/projects/{id}/files`):
-- **Weekly Demand:** `weekly_demand.csv` (Columns: `week_date`, `part_number`, `warehouse_id`, `qty_demanded`)
-- **Inventory Snapshot:** `inventory_weekly.csv` (Columns: `part_number`, `warehouse_id`, `on_hand_units`, `on_order_units`)
-- **Parts Master:** `parts.csv` (Columns: `part_number`, `unit_cost`, `lead_time_days`, `lifecycle_status`, `return_eligible`)
-- **Transfer Lanes:** `transfer_lanes.csv` (Columns: `origin_dc`, `destination_dc`, `cost_per_unit`, `transit_days`)
-- **Warehouse Capacities:** `warehouses.csv` (Columns: `dc_code`, `dedicated_pallet_capacity`, `occupied_pallets`)
+- **Supply Chain Files:** `weekly_demand.csv`, `inventory_weekly.csv`, `parts.csv`, `transfer_lanes.csv`, `warehouses.csv`.
+- **Custom Files:** Any custom CSV or Excel file (marketing data, financial logs, pricing tables, manufacturing logs).
 
 ### Step 3: Diagnostic Profiling & Approach Confirmation
 - The bot will **never jump blindly into expensive calculations** or hallucinate numbers.
 - It automatically audits missingness, duplicates, and grain, then **presents a structured analytical methodology and asks for your confirmation**:
   > *"I diagnosed 50 SKUs across 5 DCs. Reno DC is at 97% pallet capacity while Chicago faces stockout risk. I propose: 1) Syntetos-Boylan ADI/CV² velocity segmentation, 2) Dynamic Safety Stock with 95% service level for Class A, and 3) Lateral Rebalance LP. Do you approve these parameters?"*
 
-### Step 4: Deterministic Backend Execution
-- Once you reply *"Looks good, proceed"* (or adjust parameters like *"Use 98% service level for Class A"*), the agent executes the Python operations research backend.
-- It computes Dynamic Safety Stock, ROP, Order-Up-To levels, solves multi-DC lateral transfers, routes obsolete stock, and renders 300 DPI publication charts.
+### Step 4: Execution (Pre-built OR Suite OR Custom Python Notebook)
+- You have **complete flexibility** on how the analysis is executed:
+  - **Option A (Standard Supply Chain):** The agent executes verified operations research algorithms (Dynamic Safety Stock, ROP, Multi-DC Lateral Rebalance LP, Vendor Returns).
+  - **Option B (Custom Dynamic Python & Jupyter Notebook):** Ask the agent to write custom Python scripts, run simulations, perform ad-hoc regressions, or build a custom Jupyter Notebook (`.ipynb`). The agent writes the code, executes it in a sandboxed subprocess, and outputs the resulting `.ipynb` and decision charts!
 
 ### Step 5: Critic Quality Gate & Final Deliverables
 - The **Dual-Perspective Critic Agent** audits technical integrity (data hygiene, baseline comparisons, leakage prevention) and business sanity (DC pallet limits, freight ROI).
 - Once approved, the system generates the **Executive Strategy Memo**, **Technical Report**, **Action CSVs**, and **Reproducible Jupyter Notebook**.
+
+---
+
+## 🔬 Dual Execution Engine (Step 4 Deep-Dive)
+
+Step 4 is **NOT** limited to a fixed set of formulas. The system features a **Dual Execution Architecture**:
+
+```mermaid
+graph TD
+    classDef input fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#FFFFFF;
+    classDef opt fill:#064E3B,stroke:#34D399,stroke-width:2px,color:#FFFFFF;
+    classDef py fill:#312E81,stroke:#818CF8,stroke-width:2px,color:#FFFFFF;
+    classDef out fill:#451A03,stroke:#FBBF24,stroke-width:2px,color:#FFFFFF;
+
+    REQ["User Request & Confirmed Approach"]:::input
+
+    REQ -->|Standard Operations Research| OPT_ENGINE["OPTION A: Verified OR Suite<br>• Syntetos-Boylan ADI/CV²<br>• Dynamic SS & ROP<br>• Multi-DC Lateral LP<br>• Vendor Disposition"]:::opt
+    REQ -->|Custom Problem / Ad-hoc Analysis| PY_ENGINE["OPTION B: Autonomous Python Coder & Notebook Builder<br>• Dynamic Python script generation<br>• Sandboxed Subprocess Runtime<br>• Markdown explanations + Code cells<br>• Custom Charts & Simulations"]:::py
+
+    OPT_ENGINE --> ARTIFACTS["Outputs & Deliverables<br>(.ipynb, .md, .csv, .png)"]:::out
+    PY_ENGINE --> ARTIFACTS
+```
+
+### Option A: Verified Supply Chain & Operations Research Suite
+Use when solving multi-echelon inventory, warehouse bottlenecks, and replenishment policies:
+1. **Syntetos-Boylan ADI / $CV^2$ Intermittency Segmentation:** Classifies demand into *Smooth*, *Erratic*, *Intermittent*, and *Lumpy*.
+2. **Dynamic Stocking Policies:** Sizes Safety Stock ($SS = z \cdot \sqrt{L \cdot \sigma_D^2 + \bar{D}^2 \cdot \sigma_L^2}$), Reorder Points ($ROP$), and Order-Up-To levels ($S$).
+3. **Lateral Network Rebalancing Optimization:** LP formulation matching long nodes with short nodes, checking freight costs and destination warehouse pallet limits.
+4. **Lifecycle Disposition Routing:** Automatic routing to contractual vendor returns vs secondary clearance.
+
+### Option B: Autonomous Python Coder & Custom Jupyter Notebook Builder
+Use whenever you have **unique questions, custom datasets, or want custom data science**:
+- You can tell the bot:
+  - *"Can you write a Python notebook to analyze price elasticity across our parts?"*
+  - *"Run a Monte Carlo simulation of lead time disruptions for 100 days."*
+  - *"Build a clustering model on customer order frequency and create a Jupyter Notebook."*
+- **What the Agent Does:**
+  1. Dynamically writes structured Python code with data loading, calculations, and `matplotlib`/`seaborn` plotting.
+  2. Executes the script in the **Sandboxed Python Runtime** with timeout protection.
+  3. Formats the code and markdown explanations into an interactive **`.ipynb` Jupyter Notebook** saved in `projects/{id}/outputs/custom_analysis.ipynb`.
+  4. Automatically uploads the generated charts and summaries to your Telegram chat.
 
 ---
 
@@ -68,7 +107,7 @@ Whenever an analysis is executed, you receive **4 distinct deliverable tiers**:
 ### 1. 💬 Telegram Real-Time Synthesis
 - Executive markdown summary detailing financial impact (**Inventory Repositioned**, **Working Capital Released**, **Holding Cost Saved**, **Cash Recovered**).
 - **Auto-Dispatched Photo Attachments:** 300 DPI decision charts are delivered directly to your Telegram chat.
-- **Auto-Dispatched Document Attachments:** Line-item CSV action queues are sent as downloadable documents.
+- **Auto-Dispatched Document Attachments:** Line-item CSV action queues and custom `.ipynb` files are sent as downloadable documents.
 
 ### 2. 📁 Project Workspace Files (`projects/{project_id}/`)
 All outputs are structured on disk in isolated directories:
@@ -88,7 +127,8 @@ projects/{project_id}/
     ├── Technical_Analytics_Report.md   # Comprehensive technical report & critic audit
     ├── rebalance_action_queue.csv      # Operational transfer orders (Origin, Dest, Qty, Cost)
     ├── disposition_action_queue.csv    # Vendor returns & scrap clearance
-    └── reproducible_analysis.ipynb     # Fully executable Jupyter Notebook
+    ├── reproducible_analysis.ipynb     # Fully executable reproducible notebook
+    └── custom_analysis.ipynb           # Custom Python notebook built by the agent
 ```
 
 ### 3. 🗄️ Supabase Cloud Database Persistence
@@ -148,6 +188,7 @@ graph TD
         SC["Supply Chain Suite (ABC/XYZ/ADI/SS/ROP)"]:::tool
         OPT["Multi-DC Rebalance Optimization (LP)"]:::tool
         MOD["Predictive Modeling & Baselines (Forecast/RF)"]:::tool
+        NB["Jupyter Notebook Builder (.ipynb)"]:::tool
         VIZ["Decision Visualizer (Pareto/WOS/Capacity)"]:::tool
         SAND["Sandboxed Python Subprocess Runtime"]:::tool
         REP["Executive Deliverables Generator"]:::tool
@@ -172,15 +213,18 @@ graph TD
     SUP --> CRIT
     SUP --> PROF
     SUP --> SC
+    SUP --> NB
     SUP --> REP
 
     DS --> SC
     DS --> OPT
     DS --> MOD
+    DS --> NB
     DS --> VIZ
     DS --> SAND
 
     SAND --> FS
+    NB --> FS
     VIZ --> FS
     OPT --> FS
     MOD --> PG
@@ -263,12 +307,12 @@ docker-compose up -d
 
 ## 🧪 Automated Tests & Quality Verification
 
-Run the full 24-test test suite:
+Run the full 25-test test suite:
 ```powershell
 cd "c:\Users\Diandra Riando\OneDrive\Documents\Python Project\business_analytics_os"
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"; python -m pytest -p asyncio tests/ -v
 ```
 
 ```text
-============================= 24 passed in 23.76s =============================
+============================= 25 passed in 33.74s =============================
 ```

@@ -7,6 +7,7 @@ from app.tools.visualization_tools import ChartGenerationTool
 from app.tools.supply_chain import SupplyChainAnalyticsService
 from app.tools.modeling import PredictiveModelingService
 from app.tools.reporting import ReportingService
+from app.tools.notebook_tools import JupyterNotebookBuilder
 
 __all__ = [
     "BaseTool",
@@ -20,4 +21,5 @@ __all__ = [
     "SupplyChainAnalyticsService",
     "PredictiveModelingService",
     "ReportingService",
+    "JupyterNotebookBuilder",
 ]
