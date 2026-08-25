@@ -1,0 +1,35 @@
+# Environment and secrets
+.env
+.env.local
+*.env
+
+# SQLite local test files
+*.db
+*.sqlite
+*.sqlite3
+
+# Test artifacts
+test_summary.json
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local project runtime workspaces
+projects/
+_kb_temp/
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
