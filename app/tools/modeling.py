@@ -30,12 +30,9 @@ class PredictiveModelingService:
         Trains time-series demand forecasting models, comparing against named baselines
         (Naive, 4-Week Moving Average, and Croston-style SBA).
         """
-        from sqlalchemy import select
-        stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == demand_file_id)
-        res = await db.execute(stmt)
-        rec = res.scalar_one_or_none()
+        rec = await FileIngestionService.resolve_project_file(db, project_id, demand_file_id)
         if not rec:
-            return {"error": f"Demand file {demand_file_id} not found."}
+            return {"error": f"Demand file '{demand_file_id}' not found in project."}
 
         df = pd.read_csv(rec.cleaned_path or rec.raw_path)
         df.rename(columns={c: c.lower() for c in df.columns}, inplace=True)
@@ -130,14 +127,11 @@ class PredictiveModelingService:
         Trains a predictive classification model to forecast stockout risk in the next 4 weeks.
         Enforces baseline comparison (Majority class & Heuristic rule) and checks for data leakage.
         """
-        from sqlalchemy import select
-        i_stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == inventory_file_id)
-        inv_rec = (await db.execute(i_stmt)).scalar_one_or_none()
-        d_stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == demand_file_id)
-        dem_rec = (await db.execute(d_stmt)).scalar_one_or_none()
+        inv_rec = await FileIngestionService.resolve_project_file(db, project_id, inventory_file_id)
+        dem_rec = await FileIngestionService.resolve_project_file(db, project_id, demand_file_id)
 
         if not inv_rec or not dem_rec:
-            return {"error": "Inventory and Demand files required."}
+            return {"error": f"Inventory ('{inventory_file_id}') and Demand ('{demand_file_id}') files required in project."}
 
         df_inv = pd.read_csv(inv_rec.cleaned_path or inv_rec.raw_path)
         df_dem = pd.read_csv(dem_rec.cleaned_path or dem_rec.raw_path)

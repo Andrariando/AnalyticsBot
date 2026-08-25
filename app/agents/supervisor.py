@@ -68,13 +68,20 @@ class SupervisorAgent:
                 project_id=project_id,
             )
 
+        files_info = []
+        for f in state_data.get("files", []):
+            files_info.append(
+                f"• {f['filename']} (ID: `{f['id']}`, type: {f.get('file_type', 'CSV')}, rows: {f.get('row_count', 'N/A')})"
+            )
+        files_str = "\n".join(files_info) if files_info else "None uploaded yet"
+
         project_context_header = (
             f"--- CURRENT PROJECT CONTEXT ---\n"
             f"Project ID: {project_id}\n"
             f"Title: {state_data.get('title')}\n"
             f"Current Phase: {state_data.get('current_phase')}\n"
-            f"Status: {state_data.get('status')}\n"
-            f"Ingested Datasets: {[f['filename'] for f in state_data.get('files', [])]}\n"
+            f"Status: {state_data.get('status')}\n\n"
+            f"Ingested Datasets:\n{files_str}\n\n"
             f"Logged Assumptions: {len(state_data.get('assumptions', []))}\n"
             f"Logged Decisions: {len(state_data.get('decisions', []))}\n"
             f"--------------------------------\n"
@@ -131,12 +138,13 @@ class SupervisorAgent:
             }
 
         async def profile_dataset(file_id: str, rules: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-            """Run deterministic statistical profiling on an ingested tabular dataset."""
-            stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == file_id)
-            res = await db.execute(stmt)
-            file_rec = res.scalar_one_or_none()
+            """Run deterministic statistical profiling on an ingested tabular dataset (accepts UUID or filename)."""
+            file_rec = await FileIngestionService.resolve_project_file(db, project_id, file_id)
             if not file_rec:
-                return {"error": f"File with ID {file_id} not found in project."}
+                stmt = select(ProjectFile).where(ProjectFile.project_id == project_id)
+                res = await db.execute(stmt)
+                avail = [f.filename for f in res.scalars().all()]
+                return {"error": f"File '{file_id}' not found in project. Available files: {avail}"}
 
             file_path = Path(file_rec.cleaned_path or file_rec.raw_path)
             if not file_path.exists():
@@ -150,8 +158,11 @@ class SupervisorAgent:
             return summary.model_dump()
 
         async def clean_dataset(file_id: str) -> Dict[str, Any]:
-            """Clean dataset while preserving raw values and registering quality flags."""
-            return await DataCleaningService.clean_tabular_dataset(db=db, project_id=project_id, file_id=file_id)
+            """Clean dataset while preserving raw values and registering quality flags (accepts UUID or filename)."""
+            file_rec = await FileIngestionService.resolve_project_file(db, project_id, file_id)
+            if not file_rec:
+                return {"error": f"File '{file_id}' not found in project."}
+            return await DataCleaningService.clean_tabular_dataset(db=db, project_id=project_id, file_id=file_rec.id)
 
         async def calculate_velocity_segmentation(
             demand_file_id: str,
@@ -244,12 +255,10 @@ class SupervisorAgent:
             dollar_col: str = "dollar_volume",
             unit_col: Optional[str] = "unit_volume",
         ) -> Dict[str, Any]:
-            """Generate a Pareto velocity concentration curve."""
-            stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == file_id)
-            res = await db.execute(stmt)
-            file_rec = res.scalar_one_or_none()
+            """Generate a Pareto velocity concentration curve (accepts UUID or filename)."""
+            file_rec = await FileIngestionService.resolve_project_file(db, project_id, file_id)
             if not file_rec:
-                return {"error": f"File {file_id} not found."}
+                return {"error": f"File '{file_id}' not found."}
             df = pd.read_csv(file_rec.cleaned_path or file_rec.raw_path)
             return await ChartGenerationTool.create_pareto_chart(
                 db=db,

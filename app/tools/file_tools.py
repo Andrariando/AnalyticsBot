@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.models import ProjectFile
@@ -192,3 +193,66 @@ class FileIngestionService:
                 return f.read()
         else:
             raise ValueError(f"Direct text extraction not supported for {ext}. Use dataframe parser.")
+
+    @classmethod
+    async def resolve_project_file(
+        cls,
+        db: AsyncSession,
+        project_id: str,
+        identifier: Optional[str],
+    ) -> Optional[ProjectFile]:
+        """
+        Intelligently resolve a project file from either:
+        1. Exact UUID (ProjectFile.id)
+        2. Exact filename (case-insensitive)
+        3. Filename substring (e.g. 'weekly_demand' -> 'weekly_demand.csv')
+        4. Functional keywords (e.g. 'demand', 'lanes', 'warehouse', 'inventory', 'parts')
+        """
+        if not identifier or not str(identifier).strip():
+            return None
+
+        clean_id = str(identifier).strip()
+
+        # 1. Exact ID
+        stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == clean_id)
+        res = await db.execute(stmt)
+        f = res.scalar_one_or_none()
+        if f:
+            return f
+
+        # 2. Exact filename (case-insensitive)
+        stmt = select(ProjectFile).where(
+            ProjectFile.project_id == project_id,
+            ProjectFile.filename.ilike(clean_id),
+        )
+        res = await db.execute(stmt)
+        f = res.scalar_one_or_none()
+        if f:
+            return f
+
+        # 3. Filename without extension / substring
+        raw_name = clean_id.lower().replace(".csv", "").replace(".xlsx", "").replace(".xls", "").replace(".json", "")
+        stmt = select(ProjectFile).where(
+            ProjectFile.project_id == project_id,
+            ProjectFile.filename.ilike(f"%{raw_name}%"),
+        )
+        res = await db.execute(stmt)
+        files = res.scalars().all()
+        if files:
+            return files[0]
+
+        # 4. Inferred functional keyword matching
+        keywords = ["demand", "lane", "transfer", "warehouse", "part", "item", "inventory", "stock", "cost"]
+        for kw in keywords:
+            if kw in raw_name:
+                stmt = select(ProjectFile).where(
+                    ProjectFile.project_id == project_id,
+                    ProjectFile.filename.ilike(f"%{kw}%"),
+                )
+                res = await db.execute(stmt)
+                match = res.scalars().first()
+                if match:
+                    return match
+
+        return None
+

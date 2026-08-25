@@ -37,11 +37,9 @@ class MultiEchelonAnalyticsService:
           and each RDC holds echelon SS for local transit lead time (L_int).
         - Guaranteed capital reduction via portfolio effect / sub-additivity of standard deviation.
         """
-        stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == demand_file_id)
-        res = await db.execute(stmt)
-        dem_rec = res.scalar_one_or_none()
+        dem_rec = await FileIngestionService.resolve_project_file(db, project_id, demand_file_id)
         if not dem_rec:
-            return {"error": "Demand dataset not found in project."}
+            return {"error": f"Demand dataset '{demand_file_id}' not found in project."}
 
         df_dem = pd.read_csv(dem_rec.cleaned_path or dem_rec.raw_path)
 

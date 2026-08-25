@@ -37,19 +37,15 @@ class SupplyChainAnalyticsService:
         parts_file_id: Optional[str] = None,
         demand_window_weeks: int = 26,
     ) -> Dict[str, Any]:
-        stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == demand_file_id)
-        res = await db.execute(stmt)
-        demand_rec = res.scalar_one_or_none()
+        demand_rec = await FileIngestionService.resolve_project_file(db, project_id, demand_file_id)
         if not demand_rec:
-            return {"error": "Demand file not found in project."}
+            return {"error": f"Demand file '{demand_file_id}' not found in project."}
 
         df_demand = pd.read_csv(demand_rec.cleaned_path or demand_rec.raw_path)
 
         df_parts = pd.DataFrame()
         if parts_file_id:
-            pstmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == parts_file_id)
-            pres = await db.execute(pstmt)
-            parts_rec = pres.scalar_one_or_none()
+            parts_rec = await FileIngestionService.resolve_project_file(db, project_id, parts_file_id)
             if parts_rec:
                 df_parts = pd.read_csv(parts_rec.cleaned_path or parts_rec.raw_path)
 
@@ -179,18 +175,18 @@ class SupplyChainAnalyticsService:
         sl_map = service_levels or {"A": 0.95, "B": 0.90, "C": 0.85}
         z_map = {"A": 1.645, "B": 1.282, "C": 1.036}
 
-        inv_rec = (await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == inventory_file_id))).scalar_one_or_none()
-        dem_rec = (await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == demand_file_id))).scalar_one_or_none()
+        inv_rec = await FileIngestionService.resolve_project_file(db, project_id, inventory_file_id)
+        dem_rec = await FileIngestionService.resolve_project_file(db, project_id, demand_file_id)
 
         if not inv_rec or not dem_rec:
-            return {"error": "Inventory or demand file not found in project."}
+            return {"error": f"Inventory ('{inventory_file_id}') or demand ('{demand_file_id}') file not found in project."}
 
         df_inv = pd.read_csv(inv_rec.cleaned_path or inv_rec.raw_path)
         df_dem = pd.read_csv(dem_rec.cleaned_path or dem_rec.raw_path)
 
         df_parts = pd.DataFrame()
         if parts_file_id:
-            p_rec = (await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == parts_file_id))).scalar_one_or_none()
+            p_rec = await FileIngestionService.resolve_project_file(db, project_id, parts_file_id)
             if p_rec:
                 df_parts = pd.read_csv(p_rec.cleaned_path or p_rec.raw_path)
 
@@ -336,10 +332,13 @@ class SupplyChainAnalyticsService:
         df_policy = pd.read_csv(policy_csv)
 
         df_lanes = pd.DataFrame()
+        l_rec = None
         if transfer_lanes_file_id:
-            l_rec = (await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == transfer_lanes_file_id))).scalar_one_or_none()
-            if l_rec:
-                df_lanes = pd.read_csv(l_rec.cleaned_path or l_rec.raw_path)
+            l_rec = await FileIngestionService.resolve_project_file(db, project_id, transfer_lanes_file_id)
+        else:
+            l_rec = await FileIngestionService.resolve_project_file(db, project_id, "transfer_lanes")
+        if l_rec:
+            df_lanes = pd.read_csv(l_rec.cleaned_path or l_rec.raw_path)
 
         lane_costs: Dict[Tuple[str, str], float] = {}
         lane_transit: Dict[Tuple[str, str], float] = {}

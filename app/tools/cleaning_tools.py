@@ -28,12 +28,9 @@ class DataCleaningService:
         4. Saves cleaned file to projects/{project_id}/cleaned/
         5. Logs any detected anomalies to data_quality_issues in database
         """
-        from sqlalchemy import select
-        stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == file_id)
-        res = await db.execute(stmt)
-        file_rec = res.scalar_one_or_none()
+        file_rec = await FileIngestionService.resolve_project_file(db, project_id, file_id)
         if not file_rec:
-            return {"error": f"File {file_id} not found in project {project_id}."}
+            return {"error": f"File '{file_id}' not found in project {project_id}."}
 
         raw_path = Path(file_rec.raw_path)
         if not raw_path.exists():
