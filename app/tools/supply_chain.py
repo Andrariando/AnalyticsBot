@@ -1,21 +1,31 @@
-import json
+import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.db.models import Artifact, ProjectFile
+from app.db.models import Artifact, Project, ProjectFile
 from app.tools.file_tools import FileIngestionService
+
+logger = logging.getLogger(__name__)
+
+# Try importing OR-Tools
+try:
+    from ortools.linear_solver import pywraplp
+    OR_TOOLS_AVAILABLE = True
+except ImportError:
+    OR_TOOLS_AVAILABLE = False
 
 
 class SupplyChainAnalyticsService:
     """
-    Comprehensive Supply Chain & Operations Research Analytical Suite:
-    1. Velocity & Demand Pattern Segmentation (ABC, XYZ, Syntetos-Boylan ADI/CV2)
-    2. Dynamic Stocking Policy (Safety Stock, ROP, Order-Up-To, Target WOS, Excess/Shortage)
-    3. Lateral Multi-DC Network Rebalancing Optimization
-    4. Lifecycle Disposition Engine (Vendor Returns, Liquidation, Scrap)
+    Operations Research & Statistical Supply Chain Analytics Suite:
+    1. ABC / XYZ / ADI / CV2 / Syntetos-Boylan demand intermittency classification.
+    2. Dynamic Safety Stock (lead time & demand variance), Dynamic ROP, Order-Up-To (S), Target WOS.
+    3. Exact Multi-DC Lateral Network Rebalancing MILP via Google OR-Tools.
+    4. Lifecycle Disposition Queue (Contractual Vendor Returns vs Liquidation/Scrap).
     """
 
     @classmethod
@@ -27,168 +37,132 @@ class SupplyChainAnalyticsService:
         parts_file_id: Optional[str] = None,
         demand_window_weeks: int = 26,
     ) -> Dict[str, Any]:
-        """
-        Executes multi-dimensional demand classification:
-        - ABC Dollar Velocity (80/15/5%)
-        - ABC Unit Velocity (to highlight mix/velocity divergence)
-        - XYZ Demand Variability (Coefficient of Variation)
-        - Syntetos-Boylan Intermittency Classification (ADI vs CV2)
-        """
-        from sqlalchemy import select
-
-        # Load demand file
         stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == demand_file_id)
         res = await db.execute(stmt)
         demand_rec = res.scalar_one_or_none()
         if not demand_rec:
-            return {"error": f"Demand file {demand_file_id} not found."}
+            return {"error": "Demand file not found in project."}
 
-        demand_path = Path(demand_rec.cleaned_path or demand_rec.raw_path)
-        df_demand = pd.read_csv(demand_path)
+        df_demand = pd.read_csv(demand_rec.cleaned_path or demand_rec.raw_path)
 
-        # Standardize column names
-        col_map = {c: c.lower() for c in df_demand.columns}
-        df_demand.rename(columns=col_map, inplace=True)
-
-        sku_col = next((c for c in df_demand.columns if "sku" in c or "part" in c), None)
-        qty_col = next((c for c in df_demand.columns if "demand" in c or "qty" in c), None)
-        week_col = next((c for c in df_demand.columns if "week" in c or "date" in c), None)
-
-        if not sku_col or not qty_col:
-            return {"error": f"Could not identify SKU and Demand columns in {demand_path.name}"}
-
-        # Filter by recent demand window if week column available
-        if week_col:
-            df_demand[week_col] = pd.to_datetime(df_demand[week_col], errors="coerce")
-            max_date = df_demand[week_col].max()
-            min_cutoff = max_date - pd.Timedelta(weeks=demand_window_weeks)
-            df_demand = df_demand[df_demand[week_col] >= min_cutoff].copy()
-
-        # Load unit costs if parts file provided
-        parts_cost_map: Dict[str, float] = {}
+        df_parts = pd.DataFrame()
         if parts_file_id:
-            p_stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == parts_file_id)
-            p_res = await db.execute(p_stmt)
-            p_rec = p_res.scalar_one_or_none()
-            if p_rec:
-                df_parts = pd.read_csv(p_rec.cleaned_path or p_rec.raw_path)
-                df_parts.rename(columns={c: c.lower() for c in df_parts.columns}, inplace=True)
-                p_sku = next((c for c in df_parts.columns if "sku" in c or "part" in c), None)
-                p_cost = next((c for c in df_parts.columns if "cost" in c or "price" in c), None)
-                if p_sku and p_cost:
-                    parts_cost_map = dict(zip(df_parts[p_sku], pd.to_numeric(df_parts[p_cost], errors="coerce").fillna(10.0)))
+            pstmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == parts_file_id)
+            pres = await db.execute(pstmt)
+            parts_rec = pres.scalar_one_or_none()
+            if parts_rec:
+                df_parts = pd.read_csv(parts_rec.cleaned_path or parts_rec.raw_path)
 
-        # Aggregate by SKU
-        sku_groups = df_demand.groupby(sku_col)[qty_col]
-        total_units = sku_groups.sum()
-        mean_demand = sku_groups.mean()
-        std_demand = sku_groups.std(ddof=1).fillna(0.0)
+        sku_col = next((c for c in df_demand.columns if "part" in c.lower() or "sku" in c.lower()), df_demand.columns[0])
+        qty_col = next((c for c in df_demand.columns if "qty" in c.lower() or "demand" in c.lower() or "sales" in c.lower()), df_demand.columns[-1])
 
-        # Syntetos-Boylan metrics
-        # ADI = Total Periods / Non-Zero Demand Periods
-        # CV2 = (std_non_zero / mean_non_zero)^2
-        def calc_sb_metrics(series: pd.Series) -> Tuple[float, float, str]:
-            total_periods = len(series)
-            non_zero = series[series > 0]
-            non_zero_periods = len(non_zero)
-            if non_zero_periods == 0:
-                return 999.0, 999.0, "Lumpy"
+        unit_costs: Dict[str, float] = {}
+        if not df_parts.empty:
+            p_sku_col = next((c for c in df_parts.columns if "part" in c.lower() or "sku" in c.lower()), df_parts.columns[0])
+            cost_col = next((c for c in df_parts.columns if "cost" in c.lower() or "price" in c.lower()), None)
+            if cost_col:
+                unit_costs = dict(zip(df_parts[p_sku_col].astype(str), df_parts[cost_col].astype(float)))
 
-            adi = total_periods / non_zero_periods
-            mean_nz = non_zero.mean()
-            std_nz = non_zero.std(ddof=1) if non_zero_periods > 1 else 0.0
-            cv2 = float((std_nz / mean_nz) ** 2) if mean_nz > 0 else 0.0
+        records = []
+        for sku, group in df_demand.groupby(sku_col):
+            sku_str = str(sku)
+            series = group[qty_col].astype(float).values
+            total_units = float(np.sum(series))
+            unit_cost = unit_costs.get(sku_str, 50.0)
+            total_dollars = total_units * unit_cost
 
-            # Quadrant assignment (Cutoffs: ADI=1.32, CV2=0.49)
+            n_total = len(series)
+            non_zeros = series[series > 0]
+            n_nz = len(non_zeros)
+
+            adi = (n_total / n_nz) if n_nz > 0 else 99.0
+            mean_nz = float(np.mean(non_zeros)) if n_nz > 0 else 0.0
+            std_nz = float(np.std(non_zeros, ddof=1)) if n_nz > 1 else 0.0
+            cv2 = ((std_nz / mean_nz) ** 2) if mean_nz > 0 else 0.0
+
             if adi < 1.32 and cv2 < 0.49:
-                pattern = "Smooth"
+                sb_pattern = "Smooth"
             elif adi < 1.32 and cv2 >= 0.49:
-                pattern = "Erratic"
+                sb_pattern = "Erratic"
             elif adi >= 1.32 and cv2 < 0.49:
-                pattern = "Intermittent"
+                sb_pattern = "Intermittent"
             else:
-                pattern = "Lumpy"
+                sb_pattern = "Lumpy"
 
-            return round(adi, 2), round(cv2, 4), pattern
+            overall_mean = float(np.mean(series)) if n_total > 0 else 0.0
+            overall_std = float(np.std(series, ddof=1)) if n_total > 1 else 0.0
+            cv_overall = (overall_std / overall_mean) if overall_mean > 0 else 99.0
 
-        sb_results = {sku: calc_sb_metrics(group) for sku, group in sku_groups}
+            if cv_overall <= 0.5:
+                xyz_class = "X"
+            elif cv_overall <= 1.0:
+                xyz_class = "Y"
+            else:
+                xyz_class = "Z"
 
-        df_summary = pd.DataFrame({
-            "sku": total_units.index,
-            "unit_demand": total_units.values,
-            "mean_weekly_demand": mean_demand.values.round(2),
-            "std_weekly_demand": std_demand.values.round(2),
-        })
+            records.append({
+                "sku": sku_str,
+                "total_units": total_units,
+                "unit_cost": unit_cost,
+                "total_dollars": total_dollars,
+                "mean_weekly_demand": overall_mean,
+                "std_weekly_demand": overall_std,
+                "adi": round(adi, 2),
+                "cv2": round(cv2, 4),
+                "demand_pattern": sb_pattern,
+                "cv_overall": round(cv_overall, 2),
+                "xyz_class": xyz_class,
+            })
 
-        # Calculate dollar demand
-        df_summary["unit_cost"] = df_summary["sku"].map(lambda s: parts_cost_map.get(s, 15.0))
-        df_summary["dollar_demand"] = (df_summary["unit_demand"] * df_summary["unit_cost"]).round(2)
+        df_res = pd.DataFrame(records)
+        if df_res.empty:
+            return {"error": "No valid SKU series found."}
 
-        # ABC Dollar Segmentation (80/15/5%)
-        df_summary = df_summary.sort_values(by="dollar_demand", ascending=False).reset_index(drop=True)
-        total_dollar = df_summary["dollar_demand"].sum()
-        df_summary["cum_dollar_pct"] = (df_summary["dollar_demand"].cumsum() / (total_dollar if total_dollar > 0 else 1.0)) * 100.0
-        df_summary["abc_dollar"] = pd.cut(
-            df_summary["cum_dollar_pct"],
-            bins=[-np.inf, 80.0, 95.0, 100.0],
-            labels=["A", "B", "C"],
-        ).astype(str)
+        df_res = df_res.sort_values(by="total_dollars", ascending=False).reset_index(drop=True)
+        tot_dollars = df_res["total_dollars"].sum()
+        df_res["cum_dollar_pct"] = (df_res["total_dollars"].cumsum() / tot_dollars * 100) if tot_dollars > 0 else 0.0
+        df_res["abc_dollar_class"] = df_res["cum_dollar_pct"].apply(
+            lambda x: "A" if x <= 80.0 else ("B" if x <= 95.0 else "C")
+        )
 
-        # ABC Unit Segmentation
-        df_summary = df_summary.sort_values(by="unit_demand", ascending=False).reset_index(drop=True)
-        total_unit_vol = df_summary["unit_demand"].sum()
-        df_summary["cum_unit_pct"] = (df_summary["unit_demand"].cumsum() / (total_unit_vol if total_unit_vol > 0 else 1.0)) * 100.0
-        df_summary["abc_unit"] = pd.cut(
-            df_summary["cum_unit_pct"],
-            bins=[-np.inf, 80.0, 95.0, 100.0],
-            labels=["A", "B", "C"],
-        ).astype(str)
+        df_res = df_res.sort_values(by="total_units", ascending=False).reset_index(drop=True)
+        tot_units = df_res["total_units"].sum()
+        df_res["cum_unit_pct"] = (df_res["total_units"].cumsum() / tot_units * 100) if tot_units > 0 else 0.0
+        df_res["abc_unit_class"] = df_res["cum_unit_pct"].apply(
+            lambda x: "A" if x <= 80.0 else ("B" if x <= 95.0 else "C")
+        )
 
-        # XYZ Segmentation (CV = std / mean)
-        df_summary["cv"] = np.where(df_summary["mean_weekly_demand"] > 0, df_summary["std_weekly_demand"] / df_summary["mean_weekly_demand"], 99.0).round(2)
-        df_summary["xyz_class"] = pd.cut(
-            df_summary["cv"],
-            bins=[-np.inf, 0.5, 1.0, np.inf],
-            labels=["X", "Y", "Z"],
-        ).astype(str)
-
-        # Add Syntetos-Boylan fields
-        df_summary["adi"] = df_summary["sku"].map(lambda s: sb_results.get(s, (0, 0, ""))[0])
-        df_summary["cv2"] = df_summary["sku"].map(lambda s: sb_results.get(s, (0, 0, ""))[1])
-        df_summary["demand_pattern"] = df_summary["sku"].map(lambda s: sb_results.get(s, (0, 0, ""))[2])
-
-        # Combined Velocity Class (e.g. AX-Smooth, CZ-Lumpy)
-        df_summary["velocity_tier"] = df_summary["abc_dollar"] + df_summary["xyz_class"]
-
-        # Save segmentation output table to project
         project_dir = FileIngestionService.get_project_dir(project_id)
         analysis_dir = project_dir / "analysis"
         analysis_dir.mkdir(parents=True, exist_ok=True)
-        out_csv_path = analysis_dir / "sku_velocity_segmentation.csv"
-        df_summary.to_csv(out_csv_path, index=False)
+        out_csv = analysis_dir / "sku_velocity_segmentation.csv"
+        df_res.to_csv(out_csv, index=False)
 
-        # Register artifact
         art = Artifact(
             project_id=project_id,
             artifact_type="ANALYSIS_TABLE",
-            file_path=str(out_csv_path),
-            summary="SKU Velocity Segmentation Table containing ABC (Dollar & Unit), XYZ, ADI, CV2, and Syntetos-Boylan classes.",
+            file_path=str(out_csv),
+            summary=f"Velocity segmentation (ABC Dollar/Unit, XYZ, Syntetos-Boylan ADI/CV2) across {len(df_res)} SKUs.",
         )
         db.add(art)
         await db.commit()
 
-        # Breakdown stats for concise agent reasoning
-        abc_breakdown = df_summary["abc_dollar"].value_counts().to_dict()
-        pattern_breakdown = df_summary["demand_pattern"].value_counts().to_dict()
+        abc_dist = df_res["abc_dollar_class"].value_counts().to_dict()
+        sb_dist = df_res["demand_pattern"].value_counts().to_dict()
 
         return {
-            "total_skus": len(df_summary),
-            "total_dollar_demand": round(float(total_dollar), 2),
-            "total_unit_demand": int(total_unit_vol),
-            "abc_dollar_distribution": abc_breakdown,
-            "demand_pattern_distribution": pattern_breakdown,
-            "artifact_path": str(out_csv_path),
-            "sample_records": df_summary.head(5).to_dict(orient="records"),
+            "project_id": project_id,
+            "total_skus": len(df_res),
+            "total_dollar_demand": round(float(tot_dollars), 2),
+            "total_unit_demand": round(float(tot_units), 2),
+            "abc_dollar_counts": abc_dist,
+            "abc_dollar_distribution": abc_dist,
+            "abc_unit_counts": df_res["abc_unit_class"].value_counts().to_dict(),
+            "demand_pattern_counts": sb_dist,
+            "demand_pattern_distribution": sb_dist,
+            "xyz_counts": df_res["xyz_class"].value_counts().to_dict(),
+            "file_path": str(out_csv),
+            "artifact_path": str(out_csv),
         }
 
     @classmethod
@@ -200,196 +174,146 @@ class SupplyChainAnalyticsService:
         demand_file_id: str,
         parts_file_id: Optional[str] = None,
         warehouses_file_id: Optional[str] = None,
-        target_service_levels: Optional[Dict[str, float]] = None,
+        service_levels: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
-        """
-        Calculates dynamic stocking policies (Safety Stock, ROP, Order-Up-To, Target WOS)
-        and quantifies current excess, shortages, holding costs, and working capital impact.
-        """
-        from sqlalchemy import select
+        sl_map = service_levels or {"A": 0.95, "B": 0.90, "C": 0.85}
+        z_map = {"A": 1.645, "B": 1.282, "C": 1.036}
 
-        # Default service level policy by ABC tier
-        sl_map = target_service_levels or {"A": 0.95, "B": 0.90, "C": 0.85}
+        inv_rec = (await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == inventory_file_id))).scalar_one_or_none()
+        dem_rec = (await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == demand_file_id))).scalar_one_or_none()
 
-        # 1. Load Inventory Snapshot
-        i_stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == inventory_file_id)
-        inv_rec = (await db.execute(i_stmt)).scalar_one_or_none()
-        if not inv_rec:
-            return {"error": f"Inventory file {inventory_file_id} not found."}
+        if not inv_rec or not dem_rec:
+            return {"error": "Inventory or demand file not found in project."}
 
         df_inv = pd.read_csv(inv_rec.cleaned_path or inv_rec.raw_path)
-        df_inv.rename(columns={c: c.lower() for c in df_inv.columns}, inplace=True)
-
-        # 2. Load Demand File
-        d_stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == demand_file_id)
-        dem_rec = (await db.execute(d_stmt)).scalar_one_or_none()
         df_dem = pd.read_csv(dem_rec.cleaned_path or dem_rec.raw_path)
-        df_dem.rename(columns={c: c.lower() for c in df_dem.columns}, inplace=True)
 
-        sku_col = next((c for c in df_inv.columns if "sku" in c or "part" in c), "part_number")
-        dc_col = next((c for c in df_inv.columns if "dc" in c or "warehouse" in c), "warehouse_id")
-        on_hand_col = next((c for c in df_inv.columns if "hand" in c or "stock" in c), "on_hand_units")
-        on_order_col = next((c for c in df_inv.columns if "order" in c), "on_order_units")
-        dem_qty_col = next((c for c in df_dem.columns if "demand" in c or "qty" in c), "qty_demanded")
-
-        # Load parts master (cost, lead time)
-        parts_info: Dict[str, Dict[str, Any]] = {}
+        df_parts = pd.DataFrame()
         if parts_file_id:
-            p_stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == parts_file_id)
-            p_rec = (await db.execute(p_stmt)).scalar_one_or_none()
+            p_rec = (await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == parts_file_id))).scalar_one_or_none()
             if p_rec:
                 df_parts = pd.read_csv(p_rec.cleaned_path or p_rec.raw_path)
-                df_parts.rename(columns={c: c.lower() for c in df_parts.columns}, inplace=True)
-                p_sku = next((c for c in df_parts.columns if "sku" in c or "part" in c), "part_number")
-                p_cost = next((c for c in df_parts.columns if "cost" in c or "price" in c), "unit_cost")
-                p_lt = next((c for c in df_parts.columns if "lead" in c), "lead_time_days")
-                p_life = next((c for c in df_parts.columns if "life" in c), "lifecycle_status")
-                p_ret = next((c for c in df_parts.columns if "return" in c), "return_eligible")
 
-                for _, row in df_parts.iterrows():
-                    parts_info[str(row[p_sku])] = {
-                        "unit_cost": float(row.get(p_cost, 25.0)),
-                        "lead_time_days": float(row.get(p_lt, 28.0)),
-                        "lead_time_weeks": max(1.0, float(row.get(p_lt, 28.0)) / 7.0),
-                        "lifecycle": str(row.get(p_life, "ACTIVE")),
-                        "return_eligible": bool(row.get(p_ret, True)),
-                    }
+        inv_sku_col = next((c for c in df_inv.columns if "part" in c.lower() or "sku" in c.lower()), df_inv.columns[0])
+        inv_dc_col = next((c for c in df_inv.columns if "wh" in c.lower() or "dc" in c.lower() or "warehouse" in c.lower() or "location" in c.lower()), df_inv.columns[1])
+        oh_col = next((c for c in df_inv.columns if "hand" in c.lower() or "on_hand" in c.lower()), None)
+        oo_col = next((c for c in df_inv.columns if "order" in c.lower() or "on_order" in c.lower()), None)
 
-        # Calculate demand stats per SKU × DC
-        dem_stats = df_dem.groupby([sku_col, dc_col])[dem_qty_col].agg(["mean", "std"]).reset_index()
-        dem_stats.rename(columns={"mean": "mean_weekly_demand", "std": "std_weekly_demand"}, inplace=True)
-        dem_stats["std_weekly_demand"] = dem_stats["std_weekly_demand"].fillna(0.0)
+        dem_sku_col = next((c for c in df_dem.columns if "part" in c.lower() or "sku" in c.lower()), df_dem.columns[0])
+        dem_dc_col = next((c for c in df_dem.columns if "wh" in c.lower() or "dc" in c.lower() or "warehouse" in c.lower() or "location" in c.lower()), None)
+        qty_col = next((c for c in df_dem.columns if "qty" in c.lower() or "demand" in c.lower() or "sales" in c.lower()), df_dem.columns[-1])
 
-        # Merge with inventory snapshot (using most recent snapshot if multiple weeks present)
-        week_col = next((c for c in df_inv.columns if "week" in c or "date" in c), None)
-        if week_col:
-            df_inv[week_col] = pd.to_datetime(df_inv[week_col], errors="coerce")
-            max_inv_date = df_inv[week_col].max()
-            df_inv_current = df_inv[df_inv[week_col] == max_inv_date].copy()
-        else:
-            df_inv_current = df_inv.copy()
+        part_costs: Dict[str, float] = {}
+        part_lead_times: Dict[str, float] = {}
+        part_lt_stds: Dict[str, float] = {}
+        part_abc: Dict[str, str] = {}
 
-        df_policy = pd.merge(df_inv_current, dem_stats, on=[sku_col, dc_col], how="left")
-        df_policy["mean_weekly_demand"] = df_policy["mean_weekly_demand"].fillna(0.1)
-        df_policy["std_weekly_demand"] = df_policy["std_weekly_demand"].fillna(0.1)
+        if not df_parts.empty:
+            p_col = next((c for c in df_parts.columns if "part" in c.lower() or "sku" in c.lower()), df_parts.columns[0])
+            cost_c = next((c for c in df_parts.columns if "cost" in c.lower() or "price" in c.lower()), None)
+            lt_c = next((c for c in df_parts.columns if "lead" in c.lower()), None)
+            if cost_c:
+                part_costs = dict(zip(df_parts[p_col].astype(str), df_parts[cost_c].astype(float)))
+            if lt_c:
+                part_lead_times = dict(zip(df_parts[p_col].astype(str), df_parts[lt_c].astype(float) / 7.0))
 
-        # Compute dynamic safety stock and ROP
+        project_dir = FileIngestionService.get_project_dir(project_id)
+        analysis_dir = project_dir / "analysis"
+        seg_file = analysis_dir / "sku_velocity_segmentation.csv"
+        if seg_file.exists():
+            df_seg = pd.read_csv(seg_file)
+            part_abc = dict(zip(df_seg["sku"].astype(str), df_seg["abc_dollar_class"].astype(str)))
+
         results = []
-        for _, row in df_policy.iterrows():
-            sku = str(row[sku_col])
-            dc = str(row[dc_col])
-            oh = float(row.get(on_hand_col, 0.0))
-            oo = float(row.get(on_order_col, 0.0))
-            inv_pos = oh + oo
-            d_mean = float(row["mean_weekly_demand"])
-            d_std = float(row["std_weekly_demand"])
+        for _, row in df_inv.iterrows():
+            sku = str(row[inv_sku_col])
+            dc = str(row[inv_dc_col])
+            oh = float(row[oh_col]) if oh_col else 0.0
+            oo = float(row[oo_col]) if oo_col else 0.0
 
-            p_meta = parts_info.get(sku, {
-                "unit_cost": 25.0,
-                "lead_time_days": 28.0,
-                "lead_time_weeks": 4.0,
-                "lifecycle": "ACTIVE",
-                "return_eligible": True,
-            })
-
-            lt_weeks = p_meta["lead_time_weeks"]
-            unit_cost = p_meta["unit_cost"]
-
-            # Service level target by demand volume (ABC heuristic)
-            annual_dollars = d_mean * 52.0 * unit_cost
-            if annual_dollars > 20000:
-                tier = "A"
-                sl = sl_map.get("A", 0.95)
-            elif annual_dollars > 5000:
-                tier = "B"
-                sl = sl_map.get("B", 0.90)
+            if dem_dc_col and dem_dc_col in df_dem.columns:
+                dem_slice = df_dem[(df_dem[dem_sku_col].astype(str) == sku) & (df_dem[dem_dc_col].astype(str) == dc)][qty_col].astype(float)
             else:
-                tier = "C"
-                sl = sl_map.get("C", 0.85)
+                dem_slice = df_dem[df_dem[dem_sku_col].astype(str) == sku][qty_col].astype(float)
 
-            z = norm.ppf(sl)
+            mean_d = float(dem_slice.mean()) if not dem_slice.empty else 1.0
+            std_d = float(dem_slice.std()) if len(dem_slice) > 1 else (0.3 * mean_d)
 
-            # Safety Stock: SS = z * sqrt(L * sigma_d^2)
-            ss = z * np.sqrt(lt_weeks * (d_std ** 2))
-            ss = max(1.0, round(float(ss), 1))
+            lt_weeks = part_lead_times.get(sku, 4.0)
+            lt_std_weeks = part_lt_stds.get(sku, 0.5)
+            review_period_weeks = 1.0
 
-            # Reorder Point: ROP = D * L + SS
-            rop = (d_mean * lt_weeks) + ss
-            rop = round(float(rop), 1)
+            abc_tier = part_abc.get(sku, "B")
+            z_score = z_map.get(abc_tier, 1.282)
+            unit_cost = part_costs.get(sku, 50.0)
 
-            # Order Up To (S): target coverage = Lead Time + Review Period (e.g. 4 weeks) + SS
-            order_up_to = (d_mean * (lt_weeks + 4.0)) + ss
-            order_up_to = round(float(order_up_to), 1)
+            var_term = (lt_weeks * (std_d ** 2)) + ((mean_d ** 2) * (lt_std_weeks ** 2))
+            ss_units = math.ceil(z_score * math.sqrt(max(0.1, var_term)))
+            rop_units = math.ceil((mean_d * lt_weeks) + ss_units)
+            s_order_up_to = math.ceil((mean_d * (lt_weeks + review_period_weeks)) + ss_units)
+            target_wos = (s_order_up_to / mean_d) if mean_d > 0 else 0.0
+            current_wos = (oh / mean_d) if mean_d > 0 else 0.0
 
-            target_wos = round(order_up_to / (d_mean if d_mean > 0 else 0.1), 1)
-            current_wos = round(oh / (d_mean if d_mean > 0 else 0.1), 1)
+            excess_units = max(0.0, oh - s_order_up_to)
+            shortage_units = max(0.0, rop_units - (oh + oo))
 
-            excess_units = max(0.0, oh - order_up_to)
-            shortage_units = max(0.0, rop - inv_pos)
-
-            excess_dollars = round(excess_units * unit_cost, 2)
-            shortage_dollars = round(shortage_units * unit_cost, 2)
-            on_hand_dollars = round(oh * unit_cost, 2)
+            excess_dollars = excess_units * unit_cost
+            shortage_dollars = shortage_units * unit_cost
 
             results.append({
                 "sku": sku,
                 "dc": dc,
+                "abc_class": abc_tier,
                 "unit_cost": unit_cost,
-                "lead_time_weeks": lt_weeks,
-                "mean_weekly_demand": round(d_mean, 2),
-                "std_weekly_demand": round(d_std, 2),
-                "abc_tier": tier,
-                "service_level_target": sl,
-                "on_hand_units": int(oh),
-                "on_order_units": int(oo),
-                "inventory_position": int(inv_pos),
-                "on_hand_dollars": on_hand_dollars,
-                "recommended_safety_stock": ss,
-                "recommended_rop": rop,
-                "recommended_order_up_to": order_up_to,
-                "target_wos": target_wos,
-                "current_wos": current_wos,
-                "excess_units": int(excess_units),
-                "excess_dollars": excess_dollars,
-                "shortage_units": int(shortage_units),
-                "shortage_dollars": shortage_dollars,
-                "lifecycle": p_meta["lifecycle"],
-                "return_eligible": p_meta["return_eligible"],
+                "mean_weekly_demand": round(mean_d, 2),
+                "std_weekly_demand": round(std_d, 2),
+                "lead_time_weeks": round(lt_weeks, 2),
+                "on_hand_units": oh,
+                "on_order_units": oo,
+                "safety_stock_units": ss_units,
+                "rop_units": rop_units,
+                "order_up_to_units": s_order_up_to,
+                "current_wos": round(current_wos, 2),
+                "target_wos": round(target_wos, 2),
+                "excess_units": excess_units,
+                "excess_dollars": round(excess_dollars, 2),
+                "shortage_units": shortage_units,
+                "shortage_dollars": round(shortage_dollars, 2),
+                "on_hand_dollars": round(oh * unit_cost, 2),
             })
 
-        df_out = pd.DataFrame(results)
+        df_policy = pd.DataFrame(results)
+        policy_csv = analysis_dir / "stocking_policy_evaluation.csv"
+        df_policy.to_csv(policy_csv, index=False)
 
-        # Save policy table
-        project_dir = FileIngestionService.get_project_dir(project_id)
-        analysis_dir = project_dir / "analysis"
-        analysis_dir.mkdir(parents=True, exist_ok=True)
-        policy_csv_path = analysis_dir / "stocking_policy_evaluation.csv"
-        df_out.to_csv(policy_csv_path, index=False)
-
-        # Register artifact
         art = Artifact(
             project_id=project_id,
-            artifact_type="POLICY_EVALUATION",
-            file_path=str(policy_csv_path),
-            summary="Stocking Policy Table comparing actual inventory positions against recommended Dynamic SS, ROP, Order-Up-To, and WOS.",
+            artifact_type="ANALYSIS_TABLE",
+            file_path=str(policy_csv),
+            summary=f"Dynamic stocking policy evaluation across {len(df_policy)} SKU-DC nodes.",
         )
         db.add(art)
         await db.commit()
 
-        total_working_capital = df_out["on_hand_dollars"].sum()
-        total_excess_capital = df_out["excess_dollars"].sum()
-        total_shortage_capital = df_out["shortage_dollars"].sum()
+        tot_excess_val = float(df_policy["excess_dollars"].sum())
+        tot_shortage_val = float(df_policy["shortage_dollars"].sum())
+        tot_on_hand_val = float(df_policy["on_hand_dollars"].sum())
+
+        overstocked_cnt = int((df_policy["excess_units"] > 0).sum())
+        understocked_cnt = int((df_policy["shortage_units"] > 0).sum())
 
         return {
-            "total_nodes_evaluated": len(df_out),
-            "total_on_hand_working_capital": round(float(total_working_capital), 2),
-            "total_excess_working_capital": round(float(total_excess_capital), 2),
-            "total_shortage_value": round(float(total_shortage_capital), 2),
-            "overstocked_nodes_count": int((df_out["excess_units"] > 0).sum()),
-            "understocked_nodes_count": int((df_out["shortage_units"] > 0).sum()),
-            "artifact_path": str(policy_csv_path),
-            "top_excess_nodes": df_out.sort_values(by="excess_dollars", ascending=False).head(5)[["sku", "dc", "on_hand_units", "recommended_order_up_to", "excess_dollars"]].to_dict(orient="records"),
-            "top_shortage_nodes": df_out.sort_values(by="shortage_dollars", ascending=False).head(5)[["sku", "dc", "on_hand_units", "recommended_rop", "shortage_dollars"]].to_dict(orient="records"),
+            "project_id": project_id,
+            "total_nodes_evaluated": len(df_policy),
+            "total_on_hand_dollars": round(tot_on_hand_val, 2),
+            "total_excess_dollars": round(tot_excess_val, 2),
+            "total_shortage_dollars": round(tot_shortage_val, 2),
+            "overstocked_nodes_count": overstocked_cnt,
+            "understocked_nodes_count": understocked_cnt,
+            "stockout_risk_nodes_count": understocked_cnt,
+            "nodes_in_excess": overstocked_cnt,
+            "nodes_in_shortage": understocked_cnt,
+            "file_path": str(policy_csv),
         }
 
     @classmethod
@@ -397,143 +321,196 @@ class SupplyChainAnalyticsService:
         cls,
         db: AsyncSession,
         project_id: str,
-        policy_eval_file_path: Optional[str] = None,
         transfer_lanes_file_id: Optional[str] = None,
-        warehouses_file_id: Optional[str] = None,
+        max_transfers: int = 50,
     ) -> Dict[str, Any]:
-        """
-        Solves lateral multi-DC inventory rebalancing:
-        Matches long nodes (Origin DC has excess) with short nodes (Destination DC has shortage)
-        under transit lane costs, transit times, and DC pallet capacity constraints.
-        """
-        from sqlalchemy import select
+        project_dir = FileIngestionService.get_project_dir(project_id)
+        analysis_dir = project_dir / "analysis"
+        outputs_dir = project_dir / "outputs"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load policy evaluation table
-        if not policy_eval_file_path:
-            project_dir = FileIngestionService.get_project_dir(project_id)
-            policy_eval_file_path = str(project_dir / "analysis" / "stocking_policy_evaluation.csv")
+        policy_csv = analysis_dir / "stocking_policy_evaluation.csv"
+        if not policy_csv.exists():
+            return {"error": "Stocking policy evaluation not found. Run calculate_stocking_policy first."}
 
-        if not Path(policy_eval_file_path).exists():
-            return {"error": "Stocking policy evaluation file not found. Run calculate_stocking_policy first."}
+        df_policy = pd.read_csv(policy_csv)
 
-        df_policy = pd.read_csv(policy_eval_file_path)
-
-        # Load transfer lanes cost matrix
-        lane_costs: Dict[Tuple[str, str], Dict[str, float]] = {}
+        df_lanes = pd.DataFrame()
         if transfer_lanes_file_id:
-            t_stmt = select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == transfer_lanes_file_id)
-            t_rec = (await db.execute(t_stmt)).scalar_one_or_none()
-            if t_rec:
-                df_lanes = pd.read_csv(t_rec.cleaned_path or t_rec.raw_path)
-                df_lanes.rename(columns={c: c.lower() for c in df_lanes.columns}, inplace=True)
-                o_col = next((c for c in df_lanes.columns if "origin" in c or "from" in c), "origin_dc")
-                d_col = next((c for c in df_lanes.columns if "dest" in c or "to" in c), "destination_dc")
-                c_col = next((c for c in df_lanes.columns if "cost" in c), "cost_per_unit")
-                days_col = next((c for c in df_lanes.columns if "day" in c or "time" in c), "transit_days")
+            l_rec = (await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id, ProjectFile.id == transfer_lanes_file_id))).scalar_one_or_none()
+            if l_rec:
+                df_lanes = pd.read_csv(l_rec.cleaned_path or l_rec.raw_path)
 
-                for _, row in df_lanes.iterrows():
-                    lane_costs[(str(row[o_col]), str(row[d_col]))] = {
-                        "cost_per_unit": float(row.get(c_col, 5.0)),
-                        "transit_days": float(row.get(days_col, 3.0)),
-                    }
+        lane_costs: Dict[Tuple[str, str], float] = {}
+        lane_transit: Dict[Tuple[str, str], float] = {}
 
-        # Filter active SKUs with excess at origin and shortage at destination
-        rebalance_candidates = []
+        if not df_lanes.empty:
+            orig_col = next((c for c in df_lanes.columns if "orig" in c.lower() or "from" in c.lower() or "src" in c.lower()), df_lanes.columns[0])
+            dest_col = next((c for c in df_lanes.columns if "dest" in c.lower() or "to" in c.lower()), df_lanes.columns[1])
+            cost_col = next((c for c in df_lanes.columns if "cost" in c.lower() or "rate" in c.lower()), None)
+            days_col = next((c for c in df_lanes.columns if "transit" in c.lower() or "days" in c.lower()), None)
 
-        # Group by SKU
-        for sku, sku_group in df_policy.groupby("sku"):
-            long_nodes = sku_group[sku_group["excess_units"] > 0].copy()
-            short_nodes = sku_group[sku_group["shortage_units"] > 0].copy()
+            for _, row in df_lanes.iterrows():
+                o = str(row[orig_col])
+                d = str(row[dest_col])
+                c = float(row[cost_col]) if cost_col else 4.5
+                t = float(row[days_col]) if days_col else 3.0
+                lane_costs[(o, d)] = c
+                lane_transit[(o, d)] = t
 
-            if long_nodes.empty or short_nodes.empty:
-                continue
+        source_nodes = df_policy[df_policy["excess_units"] > 0].copy()
+        dest_nodes = df_policy[df_policy["shortage_units"] > 0].copy()
 
-            for _, l_node in long_nodes.iterrows():
-                origin_dc = str(l_node["dc"])
-                avail_excess = float(l_node["excess_units"])
-                origin_ss = float(l_node["recommended_safety_stock"])
-                origin_oh = float(l_node["on_hand_units"])
-                unit_cost = float(l_node["unit_cost"])
+        if source_nodes.empty or dest_nodes.empty:
+            return {"message": "No lateral rebalance candidates needed; no overlapping excess and shortage nodes."}
 
-                for _, s_node in short_nodes.iterrows():
+        rebalance_records = []
+        solver_status_str = "HEURISTIC"
+
+        if OR_TOOLS_AVAILABLE:
+            try:
+                solver = pywraplp.Solver.CreateSolver("SCIP") or pywraplp.Solver.CreateSolver("CBC")
+                if solver:
+                    x_vars = {}
+                    cand_pairs = []
+
+                    for s_idx, s_row in source_nodes.iterrows():
+                        sku = s_row["sku"]
+                        src_dc = s_row["dc"]
+                        avail_excess = int(s_row["excess_units"])
+                        unit_cost = float(s_row["unit_cost"])
+
+                        for d_idx, d_row in dest_nodes.iterrows():
+                            if d_row["sku"] != sku or d_row["dc"] == src_dc:
+                                continue
+
+                            dst_dc = d_row["dc"]
+                            shortage_qty = int(d_row["shortage_units"])
+                            lane_cost = lane_costs.get((src_dc, dst_dc), 4.5)
+                            transit_days = lane_transit.get((src_dc, dst_dc), 3.0)
+
+                            if transit_days >= 28.0:
+                                continue
+
+                            upper_bound = min(avail_excess, shortage_qty)
+                            if upper_bound > 0:
+                                var_name = f"x_{sku}_{src_dc}_{dst_dc}"
+                                var = solver.IntVar(0, upper_bound, var_name)
+                                x_vars[(s_idx, d_idx)] = var
+                                cand_pairs.append((s_idx, d_idx, sku, src_dc, dst_dc, unit_cost, lane_cost, transit_days))
+
+                    if x_vars:
+                        for s_idx, s_row in source_nodes.iterrows():
+                            out_vars = [x_vars[(s, d)] for (s, d) in x_vars if s == s_idx]
+                            if out_vars:
+                                solver.Add(solver.Sum(out_vars) <= int(s_row["excess_units"]))
+
+                        for d_idx, d_row in dest_nodes.iterrows():
+                            in_vars = [x_vars[(s, d)] for (s, d) in x_vars if d == d_idx]
+                            if in_vars:
+                                solver.Add(solver.Sum(in_vars) <= int(d_row["shortage_units"]))
+
+                        objective = solver.Objective()
+                        for (s_idx, d_idx, sku, src_dc, dst_dc, unit_cost, lane_cost, transit_days) in cand_pairs:
+                            var = x_vars[(s_idx, d_idx)]
+                            net_cost_coeff = lane_cost - (unit_cost * 1.5)
+                            objective.SetCoefficient(var, net_cost_coeff)
+                        objective.SetMinimization()
+
+                        status = solver.Solve()
+                        if status in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
+                            solver_status_str = "OPTIMAL_OR_TOOLS_MILP"
+                            for (s_idx, d_idx, sku, src_dc, dst_dc, unit_cost, lane_cost, transit_days) in cand_pairs:
+                                qty = int(x_vars[(s_idx, d_idx)].solution_value())
+                                if qty > 0:
+                                    rebalance_records.append({
+                                        "sku": sku,
+                                        "origin_dc": src_dc,
+                                        "destination_dc": dst_dc,
+                                        "transfer_units": qty,
+                                        "unit_cost": unit_cost,
+                                        "rebalanced_asset_value": round(qty * unit_cost, 2),
+                                        "freight_cost_per_unit": lane_cost,
+                                        "estimated_freight_cost": round(qty * lane_cost, 2),
+                                        "transit_days": transit_days,
+                                        "supplier_lead_time_days": 28.0,
+                                        "economic_category": "INVENTORY_REPOSITIONED",
+                                        "reason": f"OR-Tools MILP optimal match relieving shortage in {dst_dc}.",
+                                    })
+            except Exception as e:
+                logger.warning(f"OR-Tools MILP solver fallback: {e}")
+
+        if not rebalance_records:
+            solver_status_str = "HEURISTIC_PRIORITY"
+            for _, d_row in dest_nodes.sort_values(by="shortage_dollars", ascending=False).iterrows():
+                sku = d_row["sku"]
+                dst_dc = d_row["dc"]
+                shortage_qty = d_row["shortage_units"]
+                unit_cost = d_row["unit_cost"]
+
+                matching_sources = source_nodes[source_nodes["sku"] == sku].sort_values(by="excess_units", ascending=False)
+                for _, s_row in matching_sources.iterrows():
+                    src_dc = s_row["dc"]
+                    if src_dc == dst_dc:
+                        continue
+
+                    avail_excess = source_nodes.loc[s_row.name, "excess_units"]
                     if avail_excess <= 0:
-                        break
-
-                    dest_dc = str(s_node["dc"])
-                    if origin_dc == dest_dc:
                         continue
 
-                    needed_shortage = float(s_node["shortage_units"])
-                    if needed_shortage <= 0:
-                        continue
-
-                    # Determine optimal transfer quantity
-                    transfer_qty = min(avail_excess, needed_shortage)
-
-                    # Ensure origin remains at or above Safety Stock
-                    if (origin_oh - transfer_qty) < origin_ss:
-                        transfer_qty = max(0.0, origin_oh - origin_ss)
-
+                    transfer_qty = min(shortage_qty, avail_excess)
                     if transfer_qty <= 0:
                         continue
 
-                    # Lookup lane economics
-                    lane_info = lane_costs.get((origin_dc, dest_dc), {"cost_per_unit": 4.5, "transit_days": 3.0})
-                    est_transfer_cost = round(transfer_qty * lane_info["cost_per_unit"], 2)
-                    capital_rebalanced = round(transfer_qty * unit_cost, 2)
+                    lane_cost = lane_costs.get((src_dc, dst_dc), 4.5)
+                    transit_days = lane_transit.get((src_dc, dst_dc), 3.0)
 
-                    # WOS after transfer
-                    d_mean_dest = float(s_node["mean_weekly_demand"])
-                    dest_oh_after = float(s_node["on_hand_units"]) + transfer_qty
-                    dest_wos_after = round(dest_oh_after / (d_mean_dest if d_mean_dest > 0 else 0.1), 1)
-
-                    rebalance_candidates.append({
+                    rebalance_records.append({
                         "sku": sku,
-                        "origin_dc": origin_dc,
-                        "destination_dc": dest_dc,
+                        "origin_dc": src_dc,
+                        "destination_dc": dst_dc,
                         "transfer_units": int(transfer_qty),
                         "unit_cost": unit_cost,
-                        "rebalanced_asset_value": capital_rebalanced,
-                        "estimated_freight_cost": est_transfer_cost,
-                        "transit_days": lane_info["transit_days"],
-                        "supplier_lead_time_days": float(s_node["lead_time_weeks"]) * 7.0,
-                        "dest_wos_after_transfer": dest_wos_after,
+                        "rebalanced_asset_value": round(transfer_qty * unit_cost, 2),
+                        "freight_cost_per_unit": lane_cost,
+                        "estimated_freight_cost": round(transfer_qty * lane_cost, 2),
+                        "transit_days": transit_days,
+                        "supplier_lead_time_days": 28.0,
                         "economic_category": "INVENTORY_REPOSITIONED",
-                        "operational_advantage": f"Transit ({lane_info['transit_days']}d) avoids supplier PO lead time ({int(float(s_node['lead_time_weeks'])*7)}d)",
+                        "reason": f"Heuristic priority match relieving shortage in {dst_dc}.",
                     })
 
-                    avail_excess -= transfer_qty
+                    source_nodes.loc[s_row.name, "excess_units"] -= transfer_qty
+                    shortage_qty -= transfer_qty
+                    if shortage_qty <= 0:
+                        break
 
-        df_reb = pd.DataFrame(rebalance_candidates)
-        if not df_reb.empty:
-            df_reb = df_reb.sort_values(by="rebalanced_asset_value", ascending=False).reset_index(drop=True)
+        df_reb = pd.DataFrame(rebalance_records)
+        out_csv = outputs_dir / "rebalance_action_queue.csv"
+        df_reb.to_csv(out_csv, index=False)
 
-        # Save candidate queue
-        project_dir = FileIngestionService.get_project_dir(project_id)
-        outputs_dir = project_dir / "outputs"
-        outputs_dir.mkdir(parents=True, exist_ok=True)
-        reb_csv_path = outputs_dir / "rebalance_action_queue.csv"
-        df_reb.to_csv(reb_csv_path, index=False)
-
-        # Register artifact
         art = Artifact(
             project_id=project_id,
             artifact_type="ACTION_QUEUE",
-            file_path=str(reb_csv_path),
-            summary="Multi-DC Lateral Rebalance Action Queue with freight costs, transit times, and post-transfer WOS.",
+            file_path=str(out_csv),
+            summary=f"Multi-DC Lateral Rebalance Action Queue ({len(df_reb)} line-item transfers, Solver: {solver_status_str}).",
         )
         db.add(art)
         await db.commit()
 
-        total_rebalanced_value = df_reb["rebalanced_asset_value"].sum() if not df_reb.empty else 0.0
-        total_freight_cost = df_reb["estimated_freight_cost"].sum() if not df_reb.empty else 0.0
+        total_reb_val = float(df_reb["rebalanced_asset_value"].sum()) if not df_reb.empty else 0.0
+        total_freight = float(df_reb["estimated_freight_cost"].sum()) if not df_reb.empty else 0.0
 
         return {
+            "project_id": project_id,
+            "total_transfers": len(df_reb),
             "total_rebalance_actions": len(df_reb),
-            "total_asset_value_repositioned": round(float(total_rebalanced_value), 2),
-            "total_freight_investment": round(float(total_freight_cost), 2),
-            "artifact_path": str(reb_csv_path),
-            "top_transfers": df_reb.head(10).to_dict(orient="records") if not df_reb.empty else [],
+            "top_transfers": rebalance_records[:10],
+            "solver_engine": solver_status_str,
+            "total_rebalanced_asset_value": round(total_reb_val, 2),
+            "total_estimated_freight_cost": round(total_freight, 2),
+            "economic_category": "INVENTORY_REPOSITIONED",
+            "file_path": str(out_csv),
         }
 
     @classmethod
@@ -541,87 +518,82 @@ class SupplyChainAnalyticsService:
         cls,
         db: AsyncSession,
         project_id: str,
-        policy_eval_file_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Evaluates obsolete, phase-out, or massive-excess inventory for:
-        1. Vendor Returns (if return_eligible == True)
-        2. Liquidation / Scrap (if return_eligible == False or demand died)
-        """
-        if not policy_eval_file_path:
-            project_dir = FileIngestionService.get_project_dir(project_id)
-            policy_eval_file_path = str(project_dir / "analysis" / "stocking_policy_evaluation.csv")
-
-        if not Path(policy_eval_file_path).exists():
-            return {"error": "Stocking policy evaluation file not found. Run calculate_stocking_policy first."}
-
-        df_policy = pd.read_csv(policy_eval_file_path)
-
-        disposition_records = []
-        for _, row in df_policy.iterrows():
-            excess = float(row["excess_units"])
-            wos = float(row["current_wos"])
-            lifecycle = str(row.get("lifecycle", "ACTIVE"))
-            return_eligible = bool(row.get("return_eligible", True))
-            unit_cost = float(row["unit_cost"])
-
-            # Disposition condition: Obsolete/Phaseout OR Coverage > 52 weeks with excess > 10 units
-            if (lifecycle in {"PHASE_OUT", "OBSOLETE"} and excess > 0) or (wos > 52.0 and excess >= 10):
-                if return_eligible:
-                    action = "VENDOR_RETURN"
-                    econ_cat = "CASH_RECOVERED"
-                    est_recovery = round(excess * unit_cost, 2)  # Full contract credit
-                    notes = "Return to supplier under contractual return window."
-                else:
-                    action = "LIQUIDATE_OR_SCRAP"
-                    econ_cat = "WORKING_CAPITAL_RELEASED"
-                    est_recovery = round(excess * unit_cost * 0.25, 2)  # 25% salvage recovery
-                    notes = "Not return eligible; liquidate through secondary channel or scrap to free pallet space."
-
-                disposition_records.append({
-                    "sku": row["sku"],
-                    "dc": row["dc"],
-                    "lifecycle_status": lifecycle,
-                    "return_eligible": return_eligible,
-                    "current_wos": wos,
-                    "excess_units": int(excess),
-                    "unit_cost": unit_cost,
-                    "total_book_value": round(excess * unit_cost, 2),
-                    "recommended_action": action,
-                    "economic_category": econ_cat,
-                    "estimated_cash_recovery": est_recovery,
-                    "disposition_notes": notes,
-                })
-
-        df_disp = pd.DataFrame(disposition_records)
-        if not df_disp.empty:
-            df_disp = df_disp.sort_values(by="total_book_value", ascending=False).reset_index(drop=True)
-
         project_dir = FileIngestionService.get_project_dir(project_id)
+        analysis_dir = project_dir / "analysis"
         outputs_dir = project_dir / "outputs"
         outputs_dir.mkdir(parents=True, exist_ok=True)
-        disp_csv_path = outputs_dir / "disposition_action_queue.csv"
-        df_disp.to_csv(disp_csv_path, index=False)
 
-        # Register artifact
+        policy_csv = analysis_dir / "stocking_policy_evaluation.csv"
+        if not policy_csv.exists():
+            return {"error": "Stocking policy evaluation not found."}
+
+        df_policy = pd.read_csv(policy_csv)
+        excess_skus = df_policy[df_policy["excess_units"] > 0].copy()
+
+        disp_records = []
+        for _, row in excess_skus.iterrows():
+            sku = str(row["sku"])
+            dc = str(row["dc"])
+            excess_units = float(row["excess_units"])
+            unit_cost = float(row["unit_cost"])
+            excess_dollars = float(row["excess_dollars"])
+            abc_class = str(row.get("abc_class", "C"))
+
+            if abc_class == "C":
+                route = "VENDOR_RETURN"
+                recovery_rate = 0.85
+                rec_val = excess_dollars * recovery_rate
+                category = "CASH_RECOVERED"
+                action_text = f"File vendor return authorization for {excess_units:,.0f} units at 85% credit."
+            else:
+                route = "SECONDARY_LIQUIDATION"
+                recovery_rate = 0.30
+                rec_val = excess_dollars * recovery_rate
+                category = "WORKING_CAPITAL_RELEASED"
+                action_text = f"Liquidate {excess_units:,.0f} units to clear warehouse pallet capacity."
+
+            disp_records.append({
+                "sku": sku,
+                "dc": dc,
+                "excess_units": excess_units,
+                "unit_cost": unit_cost,
+                "total_book_value": excess_dollars,
+                "disposition_route": route,
+                "estimated_recovery_rate": recovery_rate,
+                "estimated_cash_recovery": round(rec_val, 2),
+                "economic_category": category,
+                "action_recommendation": action_text,
+            })
+
+        df_disp = pd.DataFrame(disp_records)
+        out_csv = outputs_dir / "disposition_action_queue.csv"
+        df_disp.to_csv(out_csv, index=False)
+
         art = Artifact(
             project_id=project_id,
             artifact_type="ACTION_QUEUE",
-            file_path=str(disp_csv_path),
-            summary="Excess Disposition Action Queue identifying Vendor Returns, Liquidations, and Scraps.",
+            file_path=str(out_csv),
+            summary=f"Lifecycle inventory disposition queue ({len(df_disp)} items).",
         )
         db.add(art)
         await db.commit()
 
-        total_disp_book_val = df_disp["total_book_value"].sum() if not df_disp.empty else 0.0
-        total_cash_rec = df_disp["estimated_cash_recovery"].sum() if not df_disp.empty else 0.0
+        tot_book = float(df_disp["total_book_value"].sum()) if not df_disp.empty else 0.0
+        tot_rec = float(df_disp["estimated_cash_recovery"].sum()) if not df_disp.empty else 0.0
+
+        vendor_cnt = int((df_disp["disposition_route"] == "VENDOR_RETURN").sum()) if not df_disp.empty else 0
+        scrap_cnt = int((df_disp["disposition_route"] != "VENDOR_RETURN").sum()) if not df_disp.empty else 0
 
         return {
+            "project_id": project_id,
+            "total_disposition_lines": len(df_disp),
             "total_disposition_candidates": len(df_disp),
-            "total_book_value_flagged": round(float(total_disp_book_val), 2),
-            "total_estimated_cash_recovery": round(float(total_cash_rec), 2),
-            "vendor_return_count": int((df_disp["recommended_action"] == "VENDOR_RETURN").sum()) if not df_disp.empty else 0,
-            "liquidation_scrap_count": int((df_disp["recommended_action"] == "LIQUIDATE_OR_SCRAP").sum()) if not df_disp.empty else 0,
-            "artifact_path": str(disp_csv_path),
-            "top_disposition_candidates": df_disp.head(10).to_dict(orient="records") if not df_disp.empty else [],
+            "total_excess_book_value": round(tot_book, 2),
+            "total_estimated_cash_recovery": round(tot_rec, 2),
+            "vendor_return_lines": vendor_cnt,
+            "vendor_returns_count": vendor_cnt,
+            "scrap_clearance_count": scrap_cnt,
+            "liquidation_scrap_count": scrap_cnt,
+            "file_path": str(out_csv),
         }

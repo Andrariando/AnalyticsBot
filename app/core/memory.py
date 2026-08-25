@@ -1,7 +1,10 @@
+import logging
 from typing import Any, Dict, List, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Conversation, Project, ProjectAssumption, ProjectDecision, ProjectFile, ProjectState
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectMemoryManager:
@@ -10,7 +13,6 @@ class ProjectMemoryManager:
     @staticmethod
     async def get_project_state(db: AsyncSession, project_id: str) -> Dict[str, Any]:
         """Fetch the full structured project state snapshot."""
-        # Query project and state
         stmt = select(Project).where(Project.id == project_id)
         res = await db.execute(stmt)
         project = res.scalar_one_or_none()
@@ -22,7 +24,6 @@ class ProjectMemoryManager:
         state_obj = state_res.scalar_one_or_none()
         payload = state_obj.state_payload if state_obj else {}
 
-        # Fetch files
         file_stmt = select(ProjectFile).where(ProjectFile.project_id == project_id)
         file_res = await db.execute(file_stmt)
         files = [
@@ -36,7 +37,6 @@ class ProjectMemoryManager:
             for f in file_res.scalars().all()
         ]
 
-        # Fetch decisions
         dec_stmt = select(ProjectDecision).where(ProjectDecision.project_id == project_id)
         dec_res = await db.execute(dec_stmt)
         decisions = [
@@ -49,7 +49,6 @@ class ProjectMemoryManager:
             for d in dec_res.scalars().all()
         ]
 
-        # Fetch assumptions
         ass_stmt = select(ProjectAssumption).where(ProjectAssumption.project_id == project_id)
         ass_res = await db.execute(ass_stmt)
         assumptions = [
@@ -98,7 +97,7 @@ class ProjectMemoryManager:
 
 
 class ConversationMemoryManager:
-    """Manages chat conversation history."""
+    """Manages chat conversation history and hierarchical rolling checkpoint summarization."""
 
     @staticmethod
     async def add_message(
@@ -135,8 +134,52 @@ class ConversationMemoryManager:
         )
         res = await db.execute(stmt)
         records = res.scalars().all()
-        # Return in chronological order
         return [
             {"role": r.role, "content": r.content, "created_at": r.created_at.isoformat()}
             for r in reversed(records)
         ]
+
+    @staticmethod
+    async def get_context_with_rolling_checkpoints(
+        db: AsyncSession,
+        chat_id: int,
+        project_id: Optional[str] = None,
+        max_raw_turns: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves context with Rolling Checkpoint Summarization:
+        - If total messages <= max_raw_turns, returns all messages.
+        - If total messages > max_raw_turns, compresses older messages into a compact rolling
+          summary block and appends the latest raw turns to keep prompt token consumption lean.
+        """
+        stmt = (
+            select(Conversation)
+            .where(Conversation.chat_id == chat_id)
+            .order_by(Conversation.created_at.asc())
+        )
+        res = await db.execute(stmt)
+        all_msgs = res.scalars().all()
+
+        if len(all_msgs) <= max_raw_turns:
+            return [{"role": m.role, "content": m.content} for m in all_msgs]
+
+        older_msgs = all_msgs[:-max_raw_turns]
+        latest_msgs = all_msgs[-max_raw_turns:]
+
+        # Compress older messages into bullet points
+        summary_bullets = []
+        for m in older_msgs[-8:]:  # Take window of older messages
+            snippet = m.content[:150].replace("\n", " ").strip()
+            summary_bullets.append(f"- [{m.role.upper()}]: {snippet}...")
+
+        checkpoint_text = (
+            "--- ROLLING CONVERSATION CHECKPOINT (Older Context) ---\n"
+            + "\n".join(summary_bullets)
+            + "\n------------------------------------------------------\n"
+        )
+
+        context = [{"role": "system", "content": checkpoint_text}]
+        for m in latest_msgs:
+            context.append({"role": m.role, "content": m.content})
+
+        return context

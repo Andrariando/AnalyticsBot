@@ -3,10 +3,11 @@ import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -14,7 +15,7 @@ from telegram.ext import (
 )
 from sqlalchemy import select
 from app.config import settings
-from app.db.session import async_session_factory
+from app.db.session import async_session_factory, init_db
 from app.db.models import User, Project, ProjectFile, KBDocument, Artifact
 from app.tools.file_tools import FileIngestionService
 from app.tools.profiling_tools import DatasetProfiler
@@ -23,6 +24,21 @@ from app.core.memory import ProjectMemoryManager
 from app.bot.formatters import format_welcome_message, format_project_summary
 
 logger = logging.getLogger(__name__)
+
+
+def get_default_action_keyboard() -> InlineKeyboardMarkup:
+    """Construct interactive Telegram inline keyboard buttons for common executive actions."""
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Approve & Run OR-Tools", callback_data="btn_approve_or"),
+            InlineKeyboardButton("📓 Build Python Notebook", callback_data="btn_build_notebook"),
+        ],
+        [
+            InlineKeyboardButton("🌐 Multi-Echelon MEIO", callback_data="btn_meio"),
+            InlineKeyboardButton("📊 Render Decision Charts", callback_data="btn_export_charts"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def get_or_create_user(telegram_user) -> User:
@@ -69,7 +85,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user or not update.message:
         return
     await get_or_create_user(update.effective_user)
-    await update.message.reply_text(format_welcome_message(), parse_mode="Markdown")
+    await update.message.reply_text(
+        format_welcome_message(),
+        parse_mode="Markdown",
+        reply_markup=get_default_action_keyboard(),
+    )
 
 
 async def new_project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -92,8 +112,9 @@ async def new_project_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         FileIngestionService.initialize_project_workspace(project.id)
 
     await update.message.reply_text(
-        f"🎯 *New Project Initialized:*\n\n• *Title:* `{title}`\n• *ID:* `{project.id}`\n• *Phase:* `INITIALIZED`\n\nUpload your data files or describe your analytical question.",
+        f"🎯 *New Project Initialized:*\n\n• *Title:* `{title}`\n• *ID:* `{project.id}`\n• *Phase:* `INITIALIZED`\n\nUpload your data files or click an action below.",
         parse_mode="Markdown",
+        reply_markup=get_default_action_keyboard(),
     )
 
 
@@ -125,21 +146,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     project = await get_active_project_for_user(user.id)
 
     async with async_session_factory() as db:
-        state = await ProjectMemoryManager.get_project_state(db, project.id)
+        state_data = await ProjectMemoryManager.get_project_state(db, project.id)
 
-    file_count = len(state.get("files", []))
-    dec_count = len(state.get("decisions", []))
-    ass_count = len(state.get("assumptions", []))
-
-    text = (
-        f"📊 *Project Status: {project.title}*\n\n"
-        f"• *Phase:* `{project.current_phase}`\n"
-        f"• *Status:* `{project.status}`\n"
-        f"• *Files Ingested:* `{file_count}`\n"
-        f"• *Assumptions Logged:* `{ass_count}`\n"
-        f"• *Decisions Recorded:* `{dec_count}`\n"
+    summary_text = format_project_summary(state_data)
+    await update.message.reply_text(
+        summary_text,
+        parse_mode="Markdown",
+        reply_markup=get_default_action_keyboard(),
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -147,108 +161,132 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message:
         return
     help_text = (
-        "💡 *Available Bot Commands:*\n\n"
-        "• `/start` - Start & get overview\n"
-        "• `/new <title>` - Start a new analytics project\n"
-        "• `/projects` - List your projects\n"
-        "• `/status` - View current project state & files\n"
-        "• `/learn` - Upload a methodology document to knowledge base\n"
+        "📖 *Autonomous Analytics Operating System Commands:*\n\n"
+        "• `/start` - Overview and quick actions\n"
+        "• `/new <Title>` - Create a new isolated workspace\n"
+        "• `/projects` - List your recent projects\n"
+        "• `/status` - View current state, files, and decisions\n"
+        "• `/learn` + file - Ingest PDF/whitepaper into Knowledge Base\n"
         "• `/help` - Show this guide\n\n"
-        "📎 *Uploading Data:*\n"
-        "Attach any CSV, Excel, or PDF file to ingest and profile it.\n\n"
-        "💬 *Asking Questions:*\n"
-        "Ask any question to trigger autonomous Python analytics, velocity segmentation, stocking policies, or predictive modeling."
+        "💡 *Interactive Actions:* Attach files to ingest, chat directly, or click the inline buttons below."
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(
+        help_text,
+        parse_mode="Markdown",
+        reply_markup=get_default_action_keyboard(),
+    )
 
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle document uploads (CSVs, Excels, PDFs)."""
+    """Handle file uploads in Telegram."""
     if not update.effective_user or not update.message or not update.message.document:
         return
 
-    doc = update.message.document
-    filename = doc.file_name or "uploaded_file"
-    caption = update.message.caption or ""
-
-    if caption.strip().startswith("/learn"):
-        await _handle_learn_document(update, context, doc, filename)
-        return
-
-    status_msg = await update.message.reply_text(f"⏳ Downloading and ingesting `{filename}`...", parse_mode="Markdown")
-
     user = await get_or_create_user(update.effective_user)
     project = await get_active_project_for_user(user.id)
+    doc = update.message.document
+
+    caption = (update.message.caption or "").strip()
+    if caption.startswith("/learn"):
+        await _handle_knowledge_ingestion(update, context, doc, project)
+        return
+
+    status_msg = await update.message.reply_text(f"📥 *Ingesting* `{doc.file_name}`...", parse_mode="Markdown")
 
     try:
         tg_file = await context.bot.get_file(doc.file_id)
-        file_bytes_io = BytesIO()
-        await tg_file.download_to_memory(file_bytes_io)
-        content_bytes = file_bytes_io.getvalue()
+        file_bytes = BytesIO()
+        await tg_file.download_to_memory(file_bytes)
+        file_bytes.seek(0)
+        content_bytes = file_bytes.read()
 
         async with async_session_factory() as db:
-            project_file = await FileIngestionService.save_and_ingest_file(
+            project_file = await FileIngestionService.save_uploaded_file(
                 db=db,
                 project_id=project.id,
-                filename=filename,
-                content_bytes=content_bytes,
+                filename=doc.file_name or "uploaded_file",
+                file_bytes=content_bytes,
             )
 
-        summary_text = (
-            f"✅ *File Ingested Successfully:*\n\n"
-            f"• *Filename:* `{project_file.filename}`\n"
-            f"• *Type:* `{project_file.file_type}`\n"
-            f"• *Rows:* `{project_file.row_count or 'N/A'}` | *Columns:* `{project_file.column_count or 'N/A'}`\n"
-            f"• *Project:* `{project.title}`\n"
+        profiling_msg = ""
+        if project_file.file_type in ["CSV", "EXCEL"]:
+            profile_res = DatasetProfiler.profile_tabular_file(
+                file_path=Path(project_file.raw_path),
+                file_id=project_file.id,
+            )
+            profiling_msg = (
+                f"\n\n📊 *Automated Profile:*\n"
+                f"• Rows: `{profile_res.row_count:,}` | Columns: `{profile_res.column_count}`\n"
+                f"• Primary Key: `{profile_res.primary_key_candidate or 'None'}`\n"
+                f"• Null Rate: `{profile_res.quality_metrics.get('overall_null_rate_pct', 0.0)}%`"
+            )
+
+        await status_msg.edit_text(
+            f"✅ *File Ingested Successfully:*\n• `{project_file.filename}` ({project_file.file_type}){profiling_msg}\n\nClick an action below or describe how you'd like to analyze this dataset.",
+            parse_mode="Markdown",
+            reply_markup=get_default_action_keyboard(),
         )
-        await status_msg.edit_text(summary_text, parse_mode="Markdown")
-
-        if caption:
-            await _process_supervisor_message(
-                update=update,
-                context=context,
-                user=user,
-                project=project,
-                user_text=f"I just uploaded `{filename}`. Context/Instruction: {caption}",
-            )
 
     except Exception as e:
-        logger.error(f"Error handling document: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Failed to ingest file: `{str(e)}`", parse_mode="Markdown")
+        logger.error(f"Failed to ingest document: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Error ingesting file: `{str(e)}`", parse_mode="Markdown")
 
 
-async def _handle_learn_document(update: Update, context: ContextTypes.DEFAULT_TYPE, doc, filename: str) -> None:
-    """Handle /learn domain document ingestion into Knowledge Base."""
-    status_msg = await update.message.reply_text(f"🧠 Parsing `{filename}` into Global Knowledge Base...", parse_mode="Markdown")
-    tg_file = await context.bot.get_file(doc.file_id)
-    file_bytes_io = BytesIO()
-    await tg_file.download_to_memory(file_bytes_io)
-    content_bytes = file_bytes_io.getvalue()
-
-    temp_dir = settings.PROJECTS_STORAGE_DIR / "_kb_temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = temp_dir / FileIngestionService.sanitize_filename(filename)
-    with open(temp_path, "wb") as f:
-        f.write(content_bytes)
-
+async def _handle_knowledge_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE, doc, project: Project) -> None:
+    """Handle /learn domain document ingestion."""
+    status_msg = await update.message.reply_text(f"🧠 *Ingesting into Knowledge Base:* `{doc.file_name}`...", parse_mode="Markdown")
     try:
-        extracted_text = FileIngestionService.extract_document_text(temp_path)
+        tg_file = await context.bot.get_file(doc.file_id)
+        file_bytes = BytesIO()
+        await tg_file.download_to_memory(file_bytes)
+        file_bytes.seek(0)
+        content = file_bytes.read().decode("utf-8", errors="replace")
+
         async with async_session_factory() as db:
             kb_doc = KBDocument(
-                source=filename,
-                document_type=temp_path.suffix.lstrip("."),
-                content=extracted_text[:100000],
-                doc_metadata={"filename": filename, "length": len(extracted_text)},
+                source=doc.file_name or "uploaded_kb_doc",
+                document_type="USER_UPLOAD",
+                content=content,
             )
             db.add(kb_doc)
             await db.commit()
 
         await status_msg.edit_text(
-            f"✅ *Knowledge Ingested:*\n\n• *Source:* `{filename}`\n• *Extracted Length:* `{len(extracted_text):,}` characters\n\nMethodology available to Supervisor and Data Scientist agents.",
+            f"✅ *Knowledge Ingested:* `{doc.file_name}` has been added to project memory.",
             parse_mode="Markdown",
         )
     except Exception as e:
         await status_msg.edit_text(f"❌ Failed to ingest knowledge document: `{e}`", parse_mode="Markdown")
+
+
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle interactive inline keyboard clicks."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    await query.answer()
+    data = query.data
+    user = await get_or_create_user(update.effective_user)
+    project = await get_active_project_for_user(user.id)
+
+    prompt_map = {
+        "btn_approve_or": "The proposed approach is approved. Please execute the complete operations research suite (velocity segmentation, dynamic stocking policy, OR-Tools lateral rebalancing, and disposition).",
+        "btn_build_notebook": "Please write custom Python code to analyze our dataset and compile it into an interactive Jupyter Notebook (.ipynb).",
+        "btn_meio": "Please execute Multi-Echelon Inventory Optimization (MEIO) to optimize safety stock positioning between our central hub and regional spoke DCs.",
+        "btn_export_charts": "Please generate high-resolution decision charts for Pareto velocity concentration and warehouse pallet utilization.",
+    }
+
+    user_text = prompt_map.get(data, data)
+    await query.message.reply_text(f"🔘 *Action Triggered:* _{user_text}_\n\nExecuting...", parse_mode="Markdown")
+
+    await _process_supervisor_message(
+        update=update,
+        context=context,
+        user=user,
+        project=project,
+        user_text=user_text,
+    )
 
 
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -283,9 +321,8 @@ async def _process_supervisor_message(
     charts_dir = project_dir / "charts"
     outputs_dir = project_dir / "outputs"
 
-    # Pre-execution artifacts snapshot
     pre_charts = set(charts_dir.glob("*.png")) if charts_dir.exists() else set()
-    pre_outputs = set(outputs_dir.glob("*.csv")) if outputs_dir.exists() else set()
+    pre_outputs = set(outputs_dir.glob("*.*")) if outputs_dir.exists() else set()
 
     try:
         supervisor = SupervisorAgent()
@@ -303,7 +340,11 @@ async def _process_supervisor_message(
             tools_executed_msg = f"⚙️ *Tools Executed:* {tools_summary}\n\n"
 
         reply_text = f"{tools_executed_msg}{agent_res.content}"
-        await status_msg.edit_text(reply_text, parse_mode="Markdown")
+        await status_msg.edit_text(
+            reply_text,
+            parse_mode="Markdown",
+            reply_markup=get_default_action_keyboard(),
+        )
 
         # Check for newly generated charts and send as photos
         if charts_dir.exists():
@@ -317,17 +358,18 @@ async def _process_supervisor_message(
                         caption=f"📈 Generated Chart: `{chart_p.name}`",
                     )
 
-        # Check for newly generated action CSVs and send as documents
+        # Check for newly generated outputs (.csv, .ipynb, .md) and send as documents
         if outputs_dir.exists():
-            post_outputs = set(outputs_dir.glob("*.csv"))
+            post_outputs = set(outputs_dir.glob("*.*"))
             new_outputs = post_outputs - pre_outputs
             for out_p in sorted(new_outputs):
-                with open(out_p, "rb") as doc_f:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=doc_f,
-                        caption=f"📄 Generated Action Queue: `{out_p.name}`",
-                    )
+                if out_p.suffix in [".csv", ".ipynb", ".md"]:
+                    with open(out_p, "rb") as doc_f:
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=doc_f,
+                            caption=f"📄 Generated Deliverable: `{out_p.name}`",
+                        )
 
     except Exception as e:
         logger.error(f"Error in supervisor execution: {e}", exc_info=True)
@@ -335,7 +377,7 @@ async def _process_supervisor_message(
 
 
 def get_bot_app() -> Optional[Application]:
-    """Build telegram application."""
+    """Build telegram application with commands, message handlers, and inline button callbacks."""
     if not settings.TELEGRAM_BOT_TOKEN:
         return None
     app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
@@ -344,6 +386,7 @@ def get_bot_app() -> Optional[Application]:
     app.add_handler(CommandHandler("projects", projects_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
     return app

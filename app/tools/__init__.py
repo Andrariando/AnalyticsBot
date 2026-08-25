@@ -8,6 +8,7 @@ from app.tools.supply_chain import SupplyChainAnalyticsService
 from app.tools.modeling import PredictiveModelingService
 from app.tools.reporting import ReportingService
 from app.tools.notebook_tools import JupyterNotebookBuilder
+from app.tools.multi_echelon import MultiEchelonAnalyticsService
 
 __all__ = [
     "BaseTool",
@@ -22,4 +23,5 @@ __all__ = [
     "PredictiveModelingService",
     "ReportingService",
     "JupyterNotebookBuilder",
+    "MultiEchelonAnalyticsService",
 ]

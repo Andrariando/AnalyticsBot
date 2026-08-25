@@ -19,7 +19,9 @@ from app.tools.supply_chain import SupplyChainAnalyticsService
 from app.tools.modeling import PredictiveModelingService
 from app.tools.reporting import ReportingService
 from app.tools.notebook_tools import JupyterNotebookBuilder
+from app.tools.multi_echelon import MultiEchelonAnalyticsService
 from app.agents.critic import CriticAgent
+from app.agents.task_runner import ParallelTaskRunner
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +43,19 @@ class SupervisorAgent:
         chat_id: Optional[int] = None,
     ) -> AgentResponse:
         """
-        Executes an autonomous turn for a given project.
+        Executes an autonomous turn for a given project with rolling checkpoint summarization.
         """
         state_data = await ProjectMemoryManager.get_project_state(db, project_id)
 
         history_messages: List[Dict[str, Any]] = []
         if chat_id:
-            raw_history = await ConversationMemoryManager.get_recent_messages(db, chat_id=chat_id, limit=8)
-            history_messages = [{"role": m["role"], "content": m["content"]} for m in raw_history]
+            # Use Rolling Checkpoint Summarization to prevent prompt token bloat
+            history_messages = await ConversationMemoryManager.get_context_with_rolling_checkpoints(
+                db=db,
+                chat_id=chat_id,
+                project_id=project_id,
+                max_raw_turns=6,
+            )
 
         history_messages.append({"role": "user", "content": user_message})
 
@@ -176,10 +183,24 @@ class SupervisorAgent:
                 warehouses_file_id=warehouses_file_id,
             )
 
+        async def calculate_multi_echelon_policy(
+            demand_file_id: str,
+            central_dc_code: str = "CDC",
+            target_service_level: float = 0.95,
+        ) -> Dict[str, Any]:
+            """Compute Multi-Echelon MEIO inventory optimization (Hub-and-Spoke risk pooling and echelon buffer sizing)."""
+            return await MultiEchelonAnalyticsService.calculate_multi_echelon_policy(
+                db=db,
+                project_id=project_id,
+                demand_file_id=demand_file_id,
+                central_dc_code=central_dc_code,
+                target_service_level=target_service_level,
+            )
+
         async def generate_rebalance_candidates(
             transfer_lanes_file_id: Optional[str] = None,
         ) -> Dict[str, Any]:
-            """Generate multi-DC lateral inventory transfer queue matching long nodes with short nodes."""
+            """Generate multi-DC lateral inventory transfer queue using exact Google OR-Tools MILP optimization."""
             return await SupplyChainAnalyticsService.generate_rebalance_candidates(
                 db=db,
                 project_id=project_id,
@@ -253,7 +274,7 @@ class SupervisorAgent:
             rationale: Optional[str] = None,
             sensitivity_tier: str = "MODERATELY_SENSITIVE",
         ) -> Dict[str, Any]:
-            """Record an explicit, auditable analytical assumption."""
+            """Record an explicit, auditable analytical assumption in project memory."""
             ass_rec = ProjectAssumption(
                 project_id=project_id,
                 assumption=assumption,
@@ -276,7 +297,7 @@ class SupervisorAgent:
             alternatives: Optional[List[str]] = None,
             risk_assessment: Optional[str] = None,
         ) -> Dict[str, Any]:
-            """Record an explicit, auditable methodological or business decision."""
+            """Record an explicit, auditable methodological or business decision in project memory."""
             dec_rec = ProjectDecision(
                 project_id=project_id,
                 decision=decision,
@@ -473,8 +494,23 @@ class SupervisorAgent:
                 handler=calculate_stocking_policy,
             ),
             ToolDefinition(
+                name="calculate_multi_echelon_policy",
+                description="Compute Multi-Echelon MEIO inventory optimization (Hub-and-Spoke risk pooling and echelon buffer sizing).",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "demand_file_id": {"type": "string"},
+                        "central_dc_code": {"type": "string"},
+                        "target_service_level": {"type": "number"},
+                    },
+                    "required": ["demand_file_id"],
+                    "additionalProperties": False,
+                },
+                handler=calculate_multi_echelon_policy,
+            ),
+            ToolDefinition(
                 name="generate_rebalance_candidates",
-                description="Generate lateral inventory transfer action queue matching long nodes with short nodes.",
+                description="Generate lateral inventory transfer action queue using exact Google OR-Tools MILP optimization.",
                 parameters={
                     "type": "object",
                     "properties": {"transfer_lanes_file_id": {"type": "string"}},
