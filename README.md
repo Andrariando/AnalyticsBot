@@ -37,9 +37,9 @@ flowchart LR
 
 ---
 
-## 📱 Interactive Telegram Inline Keyboard Buttons
+## 📱 Interactive Telegram Interface & Proactive User Guidance
 
-You don't need to type lengthy text confirmations. When the Supervisor Agent diagnoses your dataset and proposes an approach, it attaches **interactive, one-click action buttons**:
+The Telegram bot acts as an interactive executive copilot that **actively guides the user at every phase of analysis**:
 
 ```text
 ┌────────────────────────────────────────────────────────┐
@@ -52,6 +52,13 @@ You don't need to type lengthy text confirmations. When the Supervisor Agent dia
 - **`[📓 Build Python Notebook]`**: Commands the agent to dynamically write custom Python code, run exploratory data analysis, and compile a self-contained interactive Jupyter Notebook (`.ipynb`).
 - **`[🌐 Multi-Echelon MEIO]`**: Computes Central Hub (CDC) vs Regional Spoke (RDC) buffer sizing and square-root risk pooling efficiency.
 - **`[📊 Render Decision Charts]`**: Dispatches 300 DPI high-resolution Pareto velocity curves and warehouse pallet capacity charts directly to your chat.
+
+### 💬 Proactive Communication & Resilient Messaging
+- **Awaiting Input Prompts:** The bot never leaves users in the dark. After file ingestion, intermediate calculations, or recommendation proposals, it explicitly communicates:
+  - What has been processed and stored in the workspace.
+  - What decision, input, or next step is required from the stakeholder.
+  - One-click buttons and textual examples to trigger the next action.
+- **Safe Markdown & Error Fallback:** Integrated message sanitization and automatic fallback mechanisms ensure that complex dataset columns, formulas, and long reports are delivered seamlessly without entity parse errors.
 
 ---
 

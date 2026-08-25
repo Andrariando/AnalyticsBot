@@ -26,6 +26,50 @@ from app.bot.formatters import format_welcome_message, format_project_summary
 logger = logging.getLogger(__name__)
 
 
+async def safe_edit_message_text(
+    msg,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: Optional[str] = "Markdown",
+) -> None:
+    """Edit message text with automatic fallback for markdown parse errors and message length limits."""
+    if not msg:
+        return
+    max_len = 4000
+    display_text = text if len(text) <= max_len else text[:max_len] + "\n\n...(truncated for display)"
+    try:
+        await msg.edit_text(display_text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"Failed to edit message with parse_mode={parse_mode}: {e}. Retrying without markdown.")
+        try:
+            await msg.edit_text(display_text, parse_mode=None, reply_markup=reply_markup)
+        except Exception as e2:
+            logger.error(f"Failed to edit message even without markdown: {e2}")
+
+
+async def safe_reply_text(
+    target,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: Optional[str] = "Markdown",
+):
+    """Reply text with automatic fallback for markdown parse errors and message length limits."""
+    if not target:
+        return None
+    msg = target.message if hasattr(target, "message") and target.message else target
+    max_len = 4000
+    display_text = text if len(text) <= max_len else text[:max_len] + "\n\n...(truncated for display)"
+    try:
+        return await msg.reply_text(display_text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"Failed to reply with parse_mode={parse_mode}: {e}. Retrying without markdown.")
+        try:
+            return await msg.reply_text(display_text, parse_mode=None, reply_markup=reply_markup)
+        except Exception as e2:
+            logger.error(f"Failed to reply even without markdown: {e2}")
+            return None
+
+
 def get_default_action_keyboard() -> InlineKeyboardMarkup:
     """Construct interactive Telegram inline keyboard buttons for common executive actions."""
     keyboard = [
@@ -85,9 +129,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user or not update.message:
         return
     await get_or_create_user(update.effective_user)
-    await update.message.reply_text(
+    await safe_reply_text(
+        update,
         format_welcome_message(),
-        parse_mode="Markdown",
         reply_markup=get_default_action_keyboard(),
     )
 
@@ -111,9 +155,15 @@ async def new_project_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await db.refresh(project)
         FileIngestionService.initialize_project_workspace(project.id)
 
-    await update.message.reply_text(
-        f"🎯 *New Project Initialized:*\n\n• *Title:* `{title}`\n• *ID:* `{project.id}`\n• *Phase:* `INITIALIZED`\n\nUpload your data files or click an action below.",
-        parse_mode="Markdown",
+    await safe_reply_text(
+        update,
+        (
+            f"🎯 *New Project Initialized:*\n\n"
+            f"• *Title:* `{title}`\n"
+            f"• *ID:* `{project.id}`\n"
+            f"• *Phase:* `INITIALIZED`\n\n"
+            f"👉 *Next Action:* Upload your CSV/Excel datasets or click an action below."
+        ),
         reply_markup=get_default_action_keyboard(),
     )
 
@@ -129,13 +179,14 @@ async def projects_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         projects = res.scalars().all()
 
     if not projects:
-        await update.message.reply_text("You have no active projects. Use `/new <title>` to start one.", parse_mode="Markdown")
+        await safe_reply_text(update, "You have no active projects. Use `/new <title>` to start one.")
         return
 
     text = "📁 *Your Recent Analytics Projects:*\n\n"
     for p in projects:
         text += f"• *{p.title}* (`{p.current_phase}` | `{p.status}`)\n  ID: `{p.id[:8]}...`\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    text += "\n👉 *Next Step:* Upload files to your project or select an action."
+    await safe_reply_text(update, text)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,9 +200,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         state_data = await ProjectMemoryManager.get_project_state(db, project.id)
 
     summary_text = format_project_summary(state_data)
-    await update.message.reply_text(
+    await safe_reply_text(
+        update,
         summary_text,
-        parse_mode="Markdown",
         reply_markup=get_default_action_keyboard(),
     )
 
@@ -170,15 +221,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `/help` - Show this guide\n\n"
         "💡 *Interactive Actions:* Attach files to ingest, chat directly, or click the inline buttons below."
     )
-    await update.message.reply_text(
+    await safe_reply_text(
+        update,
         help_text,
-        parse_mode="Markdown",
         reply_markup=get_default_action_keyboard(),
     )
 
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle file uploads in Telegram."""
+    """Handle file uploads in Telegram with proactive status & guidance."""
     if not update.effective_user or not update.message or not update.message.document:
         return
 
@@ -191,7 +242,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _handle_knowledge_ingestion(update, context, doc, project)
         return
 
-    status_msg = await update.message.reply_text(f"📥 *Ingesting* `{doc.file_name}`...", parse_mode="Markdown")
+    status_msg = await safe_reply_text(update, f"📥 *Ingesting* `{doc.file_name}`...")
 
     try:
         tg_file = await context.bot.get_file(doc.file_id)
@@ -221,20 +272,29 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"• Null Rate: `{profile_res.quality_metrics.get('overall_null_rate_pct', 0.0)}%`"
             )
 
-        await status_msg.edit_text(
-            f"✅ *File Ingested Successfully:*\n• `{project_file.filename}` ({project_file.file_type}){profiling_msg}\n\nClick an action below or describe how you'd like to analyze this dataset.",
-            parse_mode="Markdown",
+        receipt = (
+            f"✅ *File Ingested Successfully:*\n"
+            f"• `{project_file.filename}` ({project_file.file_type}){profiling_msg}\n\n"
+            f"👉 *Awaiting Your Action:*\n"
+            f"The dataset is stored in your workspace. What would you like to analyze?\n"
+            f"• Click an action button below (e.g. *Approve & Run OR-Tools*, *Build Python Notebook*)\n"
+            f"• Or type your instruction/question directly in chat."
+        )
+
+        await safe_edit_message_text(
+            status_msg,
+            receipt,
             reply_markup=get_default_action_keyboard(),
         )
 
     except Exception as e:
         logger.error(f"Failed to ingest document: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Error ingesting file: `{str(e)}`", parse_mode="Markdown")
+        await safe_edit_message_text(status_msg, f"❌ Error ingesting file: `{str(e)}`")
 
 
 async def _handle_knowledge_ingestion(update: Update, context: ContextTypes.DEFAULT_TYPE, doc, project: Project) -> None:
     """Handle /learn domain document ingestion."""
-    status_msg = await update.message.reply_text(f"🧠 *Ingesting into Knowledge Base:* `{doc.file_name}`...", parse_mode="Markdown")
+    status_msg = await safe_reply_text(update, f"🧠 *Ingesting into Knowledge Base:* `{doc.file_name}`...")
     try:
         tg_file = await context.bot.get_file(doc.file_id)
         file_bytes = BytesIO()
@@ -251,12 +311,16 @@ async def _handle_knowledge_ingestion(update: Update, context: ContextTypes.DEFA
             db.add(kb_doc)
             await db.commit()
 
-        await status_msg.edit_text(
-            f"✅ *Knowledge Ingested:* `{doc.file_name}` has been added to project memory.",
-            parse_mode="Markdown",
+        await safe_edit_message_text(
+            status_msg,
+            (
+                f"✅ *Knowledge Ingested:* `{doc.file_name}` has been added to project memory.\n\n"
+                f"👉 *Next Action:* Select an analysis action or ask questions incorporating this methodology."
+            ),
+            reply_markup=get_default_action_keyboard(),
         )
     except Exception as e:
-        await status_msg.edit_text(f"❌ Failed to ingest knowledge document: `{e}`", parse_mode="Markdown")
+        await safe_edit_message_text(status_msg, f"❌ Failed to ingest knowledge document: `{e}`")
 
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -278,7 +342,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     }
 
     user_text = prompt_map.get(data, data)
-    await query.message.reply_text(f"🔘 *Action Triggered:* _{user_text}_\n\nExecuting...", parse_mode="Markdown")
+    await safe_reply_text(query.message, f"🔘 *Action Triggered:* _{user_text}_\n\nExecuting...")
 
     await _process_supervisor_message(
         update=update,
@@ -315,7 +379,8 @@ async def _process_supervisor_message(
     user_text: str,
 ) -> None:
     """Execute a turn with the Supervisor Agent, reply to Telegram, and send generated charts/files."""
-    status_msg = await update.message.reply_text("🤔 *Analyzing and executing analytical tools...*", parse_mode="Markdown")
+    target_msg = update.message or (update.callback_query.message if update.callback_query else None)
+    status_msg = await safe_reply_text(target_msg, "🤔 *Analyzing dataset and executing analytical tools...*")
 
     project_dir = FileIngestionService.get_project_dir(project.id)
     charts_dir = project_dir / "charts"
@@ -340,9 +405,18 @@ async def _process_supervisor_message(
             tools_executed_msg = f"⚙️ *Tools Executed:* {tools_summary}\n\n"
 
         reply_text = f"{tools_executed_msg}{agent_res.content}"
-        await status_msg.edit_text(
+
+        # Proactively prompt the user if the response doesn't already contain a clear call-to-action
+        cta_keywords = ["what would you like", "next step", "approve", "choose", "proceed", "select", "waiting", "awaiting"]
+        if not any(k in reply_text.lower() for k in cta_keywords):
+            reply_text += (
+                "\n\n👉 *Next Step / Awaiting Your Input:*\n"
+                "Please review the results above. You can approve the recommendations, request drill-downs, click an action below, or type your next question."
+            )
+
+        await safe_edit_message_text(
+            status_msg,
             reply_text,
-            parse_mode="Markdown",
             reply_markup=get_default_action_keyboard(),
         )
 
@@ -352,11 +426,14 @@ async def _process_supervisor_message(
             new_charts = post_charts - pre_charts
             for chart_p in sorted(new_charts):
                 with open(chart_p, "rb") as photo_f:
-                    await context.bot.send_photo(
-                        chat_id=update.effective_chat.id,
-                        photo=photo_f,
-                        caption=f"📈 Generated Chart: `{chart_p.name}`",
-                    )
+                    try:
+                        await context.bot.send_photo(
+                            chat_id=update.effective_chat.id,
+                            photo=photo_f,
+                            caption=f"📈 Generated Chart: {chart_p.name}",
+                        )
+                    except Exception as pe:
+                        logger.warning(f"Failed to send chart photo: {pe}")
 
         # Check for newly generated outputs (.csv, .ipynb, .md) and send as documents
         if outputs_dir.exists():
@@ -365,15 +442,22 @@ async def _process_supervisor_message(
             for out_p in sorted(new_outputs):
                 if out_p.suffix in [".csv", ".ipynb", ".md"]:
                     with open(out_p, "rb") as doc_f:
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=doc_f,
-                            caption=f"📄 Generated Deliverable: `{out_p.name}`",
-                        )
+                        try:
+                            await context.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=doc_f,
+                                caption=f"📄 Generated Deliverable: {out_p.name}",
+                            )
+                        except Exception as de:
+                            logger.warning(f"Failed to send deliverable document: {de}")
 
     except Exception as e:
         logger.error(f"Error in supervisor execution: {e}", exc_info=True)
-        await status_msg.edit_text(f"⚠️ *Supervisor Error:* `{str(e)}`", parse_mode="Markdown")
+        error_msg = (
+            f"⚠️ *Supervisor Notice:* `{str(e)}`\n\n"
+            f"👉 *Action Needed:* Please check that the required datasets (e.g. weekly demand, inventory, warehouses) are uploaded, or specify what analysis you would like to run."
+        )
+        await safe_edit_message_text(status_msg, error_msg, reply_markup=get_default_action_keyboard())
 
 
 def get_bot_app() -> Optional[Application]:

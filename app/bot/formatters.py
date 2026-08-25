@@ -27,7 +27,8 @@ def format_file_ingested_message(filename: str, rows: int, cols: int, file_id: s
         f"• *Dimensions:* `{rows:,}` rows × `{cols}` columns\n"
         f"• *Status:* Stored in isolated project workspace\n"
         f"• *ID:* `{file_id[:8]}...`\n\n"
-        f"Ready for profiling and analytical modeling."
+        f"👉 *Awaiting Your Action:*\n"
+        f"The dataset is ready. Choose an action button below or type what you would like to analyze."
     )
 
 
@@ -53,24 +54,43 @@ def format_profile_summary_telegram(summary: FileProfileSummary) -> str:
         f"• *Potential Key/Grain:* `{keys_text}`\n"
         f"• *Time Horizon:* `{date_text}`"
         f"{alerts_text}\n\n"
-        f"Proceeding to analytical methodology and modeling."
+        f"👉 *Next Step:* Click an action below or describe your analytical objective."
     )
 
 
 def format_project_summary(
-    title: str,
-    phase: str,
-    status: str,
-    file_count: int,
-    ass_count: int,
-    dec_count: int,
+    state_or_title: Any,
+    phase: Optional[str] = None,
+    status: Optional[str] = None,
+    file_count: Optional[int] = None,
+    ass_count: Optional[int] = None,
+    dec_count: Optional[int] = None,
 ) -> str:
-    """Format project status summary for Telegram."""
+    """Format project status summary for Telegram, accepting either state dict or individual fields."""
+    if isinstance(state_or_title, dict):
+        title = state_or_title.get("title", "Untitled Project")
+        phase = state_or_title.get("current_phase", "INITIALIZED")
+        status = state_or_title.get("status", "ACTIVE")
+        files = state_or_title.get("files", [])
+        file_count = len(files) if isinstance(files, list) else 0
+        assumptions = state_or_title.get("assumptions", [])
+        ass_count = len(assumptions) if isinstance(assumptions, list) else 0
+        decisions = state_or_title.get("decisions", [])
+        dec_count = len(decisions) if isinstance(decisions, list) else 0
+    else:
+        title = str(state_or_title)
+        phase = phase or "INITIALIZED"
+        status = status or "ACTIVE"
+        file_count = file_count or 0
+        ass_count = ass_count or 0
+        dec_count = dec_count or 0
+
     return (
         f"📊 *Project Status: {title}*\n\n"
         f"• *Current Phase:* `{phase}`\n"
         f"• *Status:* `{status}`\n"
         f"• *Files Ingested:* `{file_count}`\n"
         f"• *Assumptions Logged:* `{ass_count}`\n"
-        f"• *Decisions Recorded:* `{dec_count}`\n"
+        f"• *Decisions Recorded:* `{dec_count}`\n\n"
+        f"👉 *Next Action:* Select an action below or type instructions to continue."
     )
