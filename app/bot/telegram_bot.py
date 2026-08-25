@@ -252,11 +252,11 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         content_bytes = file_bytes.read()
 
         async with async_session_factory() as db:
-            project_file = await FileIngestionService.save_uploaded_file(
+            project_file = await FileIngestionService.save_and_ingest_file(
                 db=db,
                 project_id=project.id,
                 filename=doc.file_name or "uploaded_file",
-                file_bytes=content_bytes,
+                content_bytes=content_bytes,
             )
 
         profiling_msg = ""

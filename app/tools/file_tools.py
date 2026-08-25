@@ -100,9 +100,14 @@ class FileIngestionService:
         db: AsyncSession,
         project_id: str,
         filename: str,
-        content_bytes: bytes,
+        content_bytes: Optional[bytes] = None,
+        file_bytes: Optional[bytes] = None,
     ) -> ProjectFile:
         """Save raw file bytes into project workspace and create a ProjectFile record."""
+        raw_bytes = content_bytes if content_bytes is not None else file_bytes
+        if raw_bytes is None:
+            raise ValueError("No file content bytes provided.")
+
         p_dir = cls.initialize_project_workspace(project_id)
         safe_name = cls.sanitize_filename(filename)
         ext = Path(safe_name).suffix.lower()
@@ -110,14 +115,14 @@ class FileIngestionService:
         if ext not in cls.ALLOWED_EXTENSIONS:
             raise ValueError(f"Unsupported file extension: {ext}. Allowed: {cls.ALLOWED_EXTENSIONS}")
 
-        if len(content_bytes) > settings.MAX_FILE_SIZE_BYTES:
+        if len(raw_bytes) > settings.MAX_FILE_SIZE_BYTES:
             raise ValueError(
-                f"File size ({len(content_bytes)} bytes) exceeds maximum permitted ({settings.MAX_FILE_SIZE_BYTES} bytes)."
+                f"File size ({len(raw_bytes)} bytes) exceeds maximum permitted ({settings.MAX_FILE_SIZE_BYTES} bytes)."
             )
 
         raw_target_path = p_dir / "raw" / safe_name
         with open(raw_target_path, "wb") as f:
-            f.write(content_bytes)
+            f.write(raw_bytes)
 
         # Inspect basic metadata
         row_count, col_count, schema_info = cls._inspect_file_metadata(raw_target_path, ext)
@@ -135,6 +140,9 @@ class FileIngestionService:
         await db.commit()
         await db.refresh(file_record)
         return file_record
+
+    # Alias for backward compatibility
+    save_uploaded_file = save_and_ingest_file
 
     @classmethod
     def _inspect_file_metadata(
