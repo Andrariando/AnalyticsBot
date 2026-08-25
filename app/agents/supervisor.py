@@ -15,6 +15,10 @@ from app.tools.profiling_tools import DatasetProfiler
 from app.tools.runtime import PythonAnalyticsRuntime
 from app.tools.cleaning_tools import DataCleaningService
 from app.tools.visualization_tools import ChartGenerationTool
+from app.tools.supply_chain import SupplyChainAnalyticsService
+from app.tools.modeling import PredictiveModelingService
+from app.tools.reporting import ReportingService
+from app.agents.critic import CriticAgent
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +145,53 @@ class SupervisorAgent:
             """Clean dataset while preserving raw values and registering quality flags."""
             return await DataCleaningService.clean_tabular_dataset(db=db, project_id=project_id, file_id=file_id)
 
+        async def calculate_velocity_segmentation(
+            demand_file_id: str,
+            parts_file_id: Optional[str] = None,
+            demand_window_weeks: int = 26,
+        ) -> Dict[str, Any]:
+            """Compute ABC (Dollar & Unit), XYZ, ADI, CV2, and Syntetos-Boylan demand segmentation."""
+            return await SupplyChainAnalyticsService.calculate_velocity_segmentation(
+                db=db,
+                project_id=project_id,
+                demand_file_id=demand_file_id,
+                parts_file_id=parts_file_id,
+                demand_window_weeks=demand_window_weeks,
+            )
+
+        async def calculate_stocking_policy(
+            inventory_file_id: str,
+            demand_file_id: str,
+            parts_file_id: Optional[str] = None,
+            warehouses_file_id: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            """Calculate dynamic Safety Stock, ROP, Order-Up-To, Target WOS, and Excess/Shortages."""
+            return await SupplyChainAnalyticsService.calculate_stocking_policy(
+                db=db,
+                project_id=project_id,
+                inventory_file_id=inventory_file_id,
+                demand_file_id=demand_file_id,
+                parts_file_id=parts_file_id,
+                warehouses_file_id=warehouses_file_id,
+            )
+
+        async def generate_rebalance_candidates(
+            transfer_lanes_file_id: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            """Generate multi-DC lateral inventory transfer queue matching long nodes with short nodes."""
+            return await SupplyChainAnalyticsService.generate_rebalance_candidates(
+                db=db,
+                project_id=project_id,
+                transfer_lanes_file_id=transfer_lanes_file_id,
+            )
+
+        async def generate_disposition_candidates() -> Dict[str, Any]:
+            """Generate disposition action queue (Vendor Returns for contract-eligible items, Liquidation, or Scrap)."""
+            return await SupplyChainAnalyticsService.generate_disposition_candidates(
+                db=db,
+                project_id=project_id,
+            )
+
         async def run_python_analysis(code_string: str, script_name: str = "analysis.py") -> Dict[str, Any]:
             """Execute sandboxed Python analysis script in the project workspace."""
             res = await PythonAnalyticsRuntime.execute_code(
@@ -171,6 +222,15 @@ class SupervisorAgent:
                 dollar_col=dollar_col,
                 unit_col=unit_col,
             )
+
+        async def request_critic_review() -> Dict[str, Any]:
+            """Invoke the dual-perspective Critic Agent to audit technical data science and executive business sanity."""
+            critic = CriticAgent()
+            return await critic.evaluate_project(db=db, project_id=project_id)
+
+        async def generate_executive_deliverables() -> Dict[str, Any]:
+            """Generate the final executive strategy memo, full technical report, action CSVs, and Jupyter notebook."""
+            return await ReportingService.generate_executive_deliverables(db=db, project_id=project_id)
 
         async def log_assumption(
             assumption: str,
@@ -340,8 +400,69 @@ class SupervisorAgent:
                 handler=clean_dataset,
             ),
             ToolDefinition(
+                name="calculate_velocity_segmentation",
+                description="Classify SKUs by velocity (ABC Dollar/Unit), demand variability (XYZ), and intermittency (Syntetos-Boylan ADI/CV2).",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "demand_file_id": {"type": "string"},
+                        "parts_file_id": {"type": "string"},
+                        "demand_window_weeks": {"type": "integer"},
+                    },
+                    "required": ["demand_file_id"],
+                    "additionalProperties": False,
+                },
+                handler=calculate_velocity_segmentation,
+            ),
+            ToolDefinition(
+                name="calculate_stocking_policy",
+                description="Compute dynamic Safety Stock, ROP, Order-Up-To level, and Target WOS across all SKU-DC nodes.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "inventory_file_id": {"type": "string"},
+                        "demand_file_id": {"type": "string"},
+                        "parts_file_id": {"type": "string"},
+                        "warehouses_file_id": {"type": "string"},
+                    },
+                    "required": ["inventory_file_id", "demand_file_id"],
+                    "additionalProperties": False,
+                },
+                handler=calculate_stocking_policy,
+            ),
+            ToolDefinition(
+                name="generate_rebalance_candidates",
+                description="Generate lateral inventory transfer action queue matching long nodes with short nodes.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "transfer_lanes_file_id": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                handler=generate_rebalance_candidates,
+            ),
+            ToolDefinition(
+                name="generate_disposition_candidates",
+                description="Generate disposition action queue (Vendor Returns for contract-eligible items, Liquidation, or Scrap).",
+                parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                handler=generate_disposition_candidates,
+            ),
+            ToolDefinition(
+                name="request_critic_review",
+                description="Trigger formal Critic review audit to verify technical data science integrity and executive business sanity.",
+                parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                handler=request_critic_review,
+            ),
+            ToolDefinition(
+                name="generate_executive_deliverables",
+                description="Generate final Executive Strategy Memo, Full Technical Report, and reproducible Jupyter Notebook.",
+                parameters={"type": "object", "properties": {}, "additionalProperties": False},
+                handler=generate_executive_deliverables,
+            ),
+            ToolDefinition(
                 name="run_python_analysis",
-                description="Execute a sandboxed Python analysis script in the project workspace. Code can access environment variables RAW_DIR, CLEANED_DIR, ANALYSIS_DIR, CHARTS_DIR, OUTPUTS_DIR.",
+                description="Execute a sandboxed Python analysis script in the project workspace.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -360,9 +481,9 @@ class SupervisorAgent:
                     "type": "object",
                     "properties": {
                         "file_id": {"type": "string", "description": "File containing SKU volumes."},
-                        "sku_col": {"type": "string", "description": "Column name for SKU/part number."},
-                        "dollar_col": {"type": "string", "description": "Column name for dollar demand."},
-                        "unit_col": {"type": "string", "description": "Column name for unit demand."},
+                        "sku_col": {"type": "string"},
+                        "dollar_col": {"type": "string"},
+                        "unit_col": {"type": "string"},
                     },
                     "required": ["file_id", "sku_col", "dollar_col"],
                     "additionalProperties": False,

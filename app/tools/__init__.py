@@ -6,6 +6,7 @@ from app.tools.cleaning_tools import DataCleaningService
 from app.tools.visualization_tools import ChartGenerationTool
 from app.tools.supply_chain import SupplyChainAnalyticsService
 from app.tools.modeling import PredictiveModelingService
+from app.tools.reporting import ReportingService
 
 __all__ = [
     "BaseTool",
@@ -18,4 +19,5 @@ __all__ = [
     "ChartGenerationTool",
     "SupplyChainAnalyticsService",
     "PredictiveModelingService",
+    "ReportingService",
 ]
