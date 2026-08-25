@@ -95,8 +95,6 @@ async def get_or_create_user(telegram_user) -> User:
             user = User(
                 telegram_id=telegram_user.id,
                 username=telegram_user.username or f"user_{telegram_user.id}",
-                first_name=telegram_user.first_name,
-                last_name=telegram_user.last_name,
             )
             db.add(user)
             await db.commit()

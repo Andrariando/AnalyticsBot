@@ -42,8 +42,6 @@ class User(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     telegram_id = Column(BigInteger, unique=True, nullable=True, index=True)
     username = Column(String(255), nullable=True)
-    first_name = Column(String(255), nullable=True)
-    last_name = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), default=get_utc_now)
 
     projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
